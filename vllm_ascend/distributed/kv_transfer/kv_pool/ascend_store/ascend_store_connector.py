@@ -28,7 +28,12 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 from vllm.v1.serial_utils import MsgpackDecoder
 
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import AscendStoreKVConnectorWorkerMetadata
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
+    AscendStoreKVConnectorWorkerMetadata,
+    is_block_key_layerwise,
+    is_kv_save_role,
+    validate_block_key_layerwise_topology,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler import (
     KVPoolScheduler,
     get_zmq_rpc_path_lookup,
@@ -86,7 +91,13 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         self.use_layerwise = vllm_config.kv_transfer_config.kv_connector_extra_config.get("use_layerwise", False)
         backend_name = vllm_config.kv_transfer_config.kv_connector_extra_config.get("backend", "mooncake")
         self.backend_name = backend_name.lower()
-        self.use_gva_layerwise = self.use_layerwise and self.backend_name == "memcache"
+        self.use_block_key_layerwise = is_block_key_layerwise(self.use_layerwise, self.backend_name)
+        self.use_memcache_gva_layerwise = self.use_block_key_layerwise and self.backend_name == "memcache"
+        validate_block_key_layerwise_topology(
+            vllm_config.parallel_config,
+            self.backend_name,
+            self.use_block_key_layerwise,
+        )
         self.consumer_is_to_put = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
             "consumer_is_to_put", False
         )
@@ -200,7 +211,7 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
     def set_layerwise_pd_transfer_waiter(self, waiter: Callable[[int], None]) -> None:
         """Make layerwise save completion include co-located PD reads."""
         worker = getattr(self, "connector_worker", None)
-        if not self.use_gva_layerwise or worker is None:
+        if not self.use_block_key_layerwise or worker is None:
             return
         worker.set_layerwise_pd_transfer_waiter(waiter)
 
@@ -234,15 +245,19 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         if not self.use_layerwise:
             return
 
-        if self.kv_role == "kv_consumer":
-            # Don't do save if the role is kv_consumer
+        # Pure consumers advance in wait_for_layer_load. A consumer-to-put
+        # follows the same post-attention save hook as producers.
+        if not is_kv_save_role(self.kv_role, self.consumer_is_to_put):
             return
         self.connector_worker.save_kv_layer(self._get_connector_metadata())
 
     def on_kv_cache_written(self, layer_name: str = "") -> None:
         # Dispatch the layerwise save at scatter time; save_kv_layer covers any
         # layer the attention hook skips (e.g. layers without an indexer).
-        if not self.use_gva_layerwise or self.kv_role == "kv_consumer":
+        if not self.use_block_key_layerwise or not is_kv_save_role(
+            self.kv_role,
+            self.consumer_is_to_put,
+        ):
             return
         if not self.has_connector_metadata():
             return
@@ -252,8 +267,8 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         worker.on_kv_cache_written(layer_name)
 
     def wait_for_save(self):
-        if self.kv_role == "kv_consumer" and not self.consumer_is_to_put:
-            # Don't do save if the role is kv_consumer
+        # Whole-key pure consumers have no save completion to wait for.
+        if not is_kv_save_role(self.kv_role, self.consumer_is_to_put):
             return
 
         if self.use_layerwise:

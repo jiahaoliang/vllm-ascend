@@ -7,6 +7,7 @@ import threading
 import time
 from collections import defaultdict
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -43,6 +44,11 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_transfer
 )
 
 _H2D_STAGGER_SPIN_US = 50
+
+
+@dataclass(frozen=True)
+class _LayerRevokeTask:
+    keys: tuple[str, ...]
 
 
 def _circular_shift(lst: list, offset: int) -> list:
@@ -1587,6 +1593,11 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
     ) -> torch.Tensor:
         self.request_queue.put(req_meta)
 
+    def add_revoke_request(self, keys: list[str]) -> None:
+        deduplicated_keys = tuple(dict.fromkeys(keys))
+        if deduplicated_keys:
+            self.request_queue.put(_LayerRevokeTask(deduplicated_keys))
+
     def _remove_started_keys(self, keys: list[str]) -> None:
         with self._put_started_keys_lock:
             self._put_started_keys.difference_update(keys)
@@ -1755,8 +1766,15 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         self.request_queue.task_done()
 
     def _handle_request(  # type: ignore[override]
-        self, request: LayerSaveTask | LayerwisePreparation
+        self,
+        request: LayerSaveTask | LayerwisePreparation | _LayerRevokeTask,
     ):
+        if isinstance(request, _LayerRevokeTask):
+            try:
+                self._revoke_range_keys(list(request.keys))
+            finally:
+                self.request_queue.task_done()
+            return
         if isinstance(request, LayerwisePreparation):
             try:
                 request.ensure_ready()
