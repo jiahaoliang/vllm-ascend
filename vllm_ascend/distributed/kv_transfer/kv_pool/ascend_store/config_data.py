@@ -18,6 +18,50 @@ from vllm_ascend.memcache_comm_fence import AttentionComputeStartGate
 
 _GROUPED_BLOCK_HASH_DOMAIN = b"vllm-ascend-grouped-block-hash-v1\0"
 _GROUPED_BLOCK_HASH_LENGTH_PREFIX_BYTES = 4
+_BLOCK_KEY_LAYERWISE_BACKENDS = frozenset({"memcache", "mooncake"})
+
+
+def make_layerwise_block_key(
+    model_name: str,
+    block_hash_or_tail: str,
+    head_or_tp_rank: int,
+) -> str:
+    return f"{model_name}@{block_hash_or_tail}@{head_or_tp_rank}"
+
+
+def is_block_key_layerwise(use_layerwise: bool, backend_name: str) -> bool:
+    return use_layerwise and backend_name.lower() in _BLOCK_KEY_LAYERWISE_BACKENDS
+
+
+def validate_block_key_layerwise_topology(
+    parallel_config: Any,
+    backend_name: str,
+    use_block_key_layerwise: bool,
+) -> None:
+    backend_name = backend_name.lower()
+    if not use_block_key_layerwise or backend_name not in _BLOCK_KEY_LAYERWISE_BACKENDS:
+        return
+
+    # Canonical block keys omit pipeline, prefill-context, and decode-context
+    # parallel coordinates. Reject those topologies until the key schema and
+    # cross-rank completeness rules grow.
+    topology_dimensions = (
+        ("pipeline_parallel_size", parallel_config.pipeline_parallel_size),
+        (
+            "prefill_context_parallel_size",
+            parallel_config.prefill_context_parallel_size,
+        ),
+        (
+            "decode_context_parallel_size",
+            parallel_config.decode_context_parallel_size,
+        ),
+    )
+    unsupported = [f"{label}={size}" for label, size in topology_dimensions if size > 1]
+    if unsupported:
+        raise ValueError(
+            f"{backend_name} block-key layerwise supports TP-only topology; unsupported "
+            + ", ".join(unsupported)
+        )
 
 
 @dataclass(frozen=True)
@@ -803,6 +847,14 @@ class ReqMeta:
 
     event_id: int | None = None
 
+    save_block_keys: list[str | None]
+    save_key_block_offset: int
+    save_last_block_key: str | None
+    load_block_keys: list[str | None]
+    load_key_block_offset: int
+    load_last_block_key: str | None
+    load_keys: list[str]
+
     def __init__(
         self,
         req_id: str,
@@ -825,7 +877,26 @@ class ReqMeta:
         save_end_token: int | None = None,
         target_token_len: int | None = None,
         save_start_token: int = 0,
+        last_block_gva: int | None = None,
+        partial_block_index: int | None = None,
+        starts: list[int] | None = None,
+        ends: list[int] | None = None,
+        sizes_per_chunk: list[list[int]] | None = None,
+        block_ids_np: np.ndarray | None = None,
         block_ids_by_group_np: list[np.ndarray] | None = None,
+        block_gvas_np: np.ndarray | None = None,
+        block_gvas_by_group_np: list[np.ndarray] | None = None,
+        gva_block_offset: int = 0,
+        load_block_gvas_np: np.ndarray | None = None,
+        load_block_gvas_by_group_np: list[np.ndarray] | None = None,
+        load_gva_block_offset: int = 0,
+        save_block_keys: list[str | None] | None = None,
+        save_key_block_offset: int = 0,
+        save_last_block_key: str | None = None,
+        load_block_keys: list[str | None] | None = None,
+        load_key_block_offset: int = 0,
+        load_last_block_key: str | None = None,
+        load_keys: list[str] | None = None,
     ) -> None:
         if token_len_chunk is None:
             token_len_chunk = 0 if save_end_token is None else save_end_token
@@ -850,9 +921,28 @@ class ReqMeta:
         self.token_ids = token_ids
         self.original_block_size = original_block_size
         self.event_id = event_id
+        self.last_block_gva = last_block_gva
+        self.partial_block_index = partial_block_index
+        self.starts = starts
+        self.ends = ends
+        self.sizes_per_chunk = sizes_per_chunk
+        self.block_ids_np = block_ids_np
         if block_ids_by_group_np is None:
             block_ids_by_group_np = [np.asarray(ids, dtype=np.int64) for ids in block_ids_by_group]
         self.block_ids_by_group_np = block_ids_by_group_np
+        self.block_gvas_np = block_gvas_np
+        self.block_gvas_by_group_np = block_gvas_by_group_np
+        self.gva_block_offset = gva_block_offset
+        self.load_block_gvas_np = load_block_gvas_np
+        self.load_block_gvas_by_group_np = load_block_gvas_by_group_np
+        self.load_gva_block_offset = load_gva_block_offset
+        self.save_block_keys = [] if save_block_keys is None else list(save_block_keys)
+        self.save_key_block_offset = save_key_block_offset
+        self.save_last_block_key = save_last_block_key
+        self.load_block_keys = [] if load_block_keys is None else list(load_block_keys)
+        self.load_key_block_offset = load_key_block_offset
+        self.load_last_block_key = load_last_block_key
+        self.load_keys = [] if load_keys is None else list(load_keys)
 
     @property
     def block_ids(self) -> list[int]:
@@ -862,7 +952,19 @@ class ReqMeta:
     def block_ids(self, block_ids: list[int] | list[list[int]]) -> None:
         self.block_ids_by_group = normalize_block_ids_by_group(block_ids)
 
+    last_block_gva: int | None = None
+    partial_block_index: int | None = None
+    starts: list[int] | None = None
+    ends: list[int] | None = None
+
+    sizes_per_chunk: list[list[int]] | None = None
+
+    block_ids_np: np.ndarray | None = None
     block_ids_by_group_np: list[np.ndarray]
+    block_gvas_np: np.ndarray | None = None
+    block_gvas_by_group_np: list[np.ndarray] | None = None
+    gva_block_offset: int = 0
+    load_block_gvas_by_group_np: list[np.ndarray] | None = None
 
     @staticmethod
     def from_request_tracker(
@@ -974,10 +1076,23 @@ class LayerTransferArrays:
 
 
 @dataclass
+class LayerRangeReqMeta:
+    req_ids: list[str]
+    layer_id: int
+    block_ids: list[int]
+    keys: list[str]
+    all_buffers: list[list[int]]
+    all_sizes: list[list[int]]
+    all_offsets: list[list[int]]
+    load_keys: list[str] = field(default_factory=list)
+
+
+@dataclass
 class LayerBlockRange:
     request: ReqMeta
     start_block: int
     end_block: int
+    partial_block_index: int | None = None
 
 
 @dataclass
@@ -1035,9 +1150,25 @@ class LayerwisePreparation:
 
 
 @dataclass
+class SharedBlockData:
+    """Pre-computed Mooncake block data shared across transferred layers."""
+
+    block_ids_arr: np.ndarray
+    block_gvas_arr: np.ndarray | None
+    req_ids: list[str]
+    is_last_chunks: list[bool | None]
+    block_keys: list[str] | None = None
+    load_keys: list[str] = field(default_factory=list)
+
+
+@dataclass
 class LayerTransferTask:
     layer_id: int
     block_ranges: list[LayerBlockRange]
+    shared_block_data: SharedBlockData | None = None
+    # Cache for KVCacheStoreKeyLayerSendingThread:
+    # maps block_range index -> list of (start, end, key_all_layers)
+    cached_process_tokens: dict[int, list[tuple[int, int, list]]] | None = None
     transfer_data: GroupTransferData | None = None
     completion: TransferCompletion | None = None
     # Requests whose final actual transfer is this task. Populated once during
@@ -1049,9 +1180,8 @@ class LayerTransferTask:
     preparation: LayerwisePreparation | None = None
     # Keys published after this task completes the final copy into their GVAs.
     write_finish_keys: list[str] = field(default_factory=list)
-    # Cache for KVCacheStoreKeyLayerSendingThread:
-    # maps block_range index -> list of (start, end, key_all_layers)
-    cached_process_tokens: dict[int, list[tuple[int, int, list]]] | None = None
+    # Batch kind is independent of whether session setup filtered every key.
+    use_key_major_ranges: bool = False
 
 
 @dataclass
