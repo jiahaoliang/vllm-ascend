@@ -406,12 +406,7 @@ _kv_pool_pkg = _make_pkg("vllm_ascend.distributed.kv_transfer.kv_pool")
 sys.modules["vllm_ascend.distributed.kv_transfer.kv_pool"] = _kv_pool_pkg
 
 _ascend_store_real_path = os.path.join(
-    os.path.dirname(__file__),
-    "..",
-    "..",
-    "..",
-    "..",
-    "vllm_ascend",
+    _vllm_ascend_real_path,
     "distributed",
     "kv_transfer",
     "kv_pool",
@@ -461,3 +456,5 @@ if "vllm_ascend.utils" not in sys.modules or not hasattr(sys.modules["vllm_ascen
 # which collect after ascend_store and bind the polluted symbols at import).
 # These helpers are mocked per-test, scoped to the ascend_store tests only,
 # via the autouse fixture in tests/ut/conftest.py.
+# vllm_ascend.distributed.parallel_state follows the same rule; test_backend
+# supplies a scoped get_global_rank stub only while importing MooncakeBackend.
