@@ -15,7 +15,10 @@ from vllm.distributed.kv_events import BlockStored
 from vllm.logger import logger
 from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
 
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend import Backend
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend import (
+    Backend,
+    require_aligned_batch_results,
+)
 
 # isort: off
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
@@ -246,6 +249,7 @@ class LayerBatchBuilder:
         req_ids: list[str] = []
         is_last_chunks: list[bool | None] = []
         all_load_keys: list[str] = []
+        seen_save_keys: set[str] = set()
 
         for block_range in task.block_ranges:
             request = block_range.request
@@ -287,9 +291,11 @@ class LayerBatchBuilder:
                 request_keys[key_start:key_end],
                 strict=True,
             ):
-                if key is not None:
+                if key is not None and (not is_save or key not in seen_save_keys):
                     block_ids.append(block_id)
                     block_keys.append(key)
+                    if is_save:
+                        seen_save_keys.add(key)
 
             if block_range.partial_block_index is not None:
                 partial_block_index = block_range.partial_block_index
@@ -298,9 +304,13 @@ class LayerBatchBuilder:
                         f"ReqMeta block metadata does not cover partial block "
                         f"index {partial_block_index}"
                     )
-                if last_block_key is not None:
+                if last_block_key is not None and (
+                    not is_save or last_block_key not in seen_save_keys
+                ):
                     block_ids.append(request_block_ids[partial_block_index])
                     block_keys.append(last_block_key)
+                    if is_save:
+                        seen_save_keys.add(last_block_key)
 
         return SharedBlockData(
             block_ids_arr=np.asarray(block_ids, dtype=np.int64),
@@ -439,7 +449,8 @@ class LayerBatchBuilder:
         shared = self.build_shared(task, is_save)
         if shared is None:
             return None
-        return self.build_addrs(shared, task.layer_idx_in_group)
+        layer_index = task.layer_id if task.use_key_major_ranges else task.layer_idx_in_group
+        return self.build_addrs(shared, layer_index)
 
 
 class KVTransferThread(threading.Thread):
@@ -1472,6 +1483,9 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         pd_transfer_waiter: Callable[[int], None] | None = None,
         sync_attn_events: list[torch.npu.Event] | None = None,
         layer_attn_recorded_events: list[threading.Event] | None = None,
+        group_builders: list[LayerBatchBuilder] | None = None,
+        put_started_keys: set[str] | None = None,
+        put_started_keys_lock: threading.Lock | None = None,
     ):
         super().__init__(
             m_store,
@@ -1503,6 +1517,14 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                 num_layers,
                 group_id=0,
             )
+        self._put_started_keys = put_started_keys if put_started_keys is not None else set()
+        self._put_started_keys_lock = put_started_keys_lock or threading.Lock()
+        self._active_put_keys: set[str] | None = None
+        self.group_builders: list[LayerBatchBuilder] | None = group_builders
+        if group_builders is not None:
+            self.layer_batch_builder = group_builders[0]
+        else:
+            self.layer_batch_builder = None
 
     def add_stored_request(self, req_id: str):
         with self.done_task_lock:
@@ -1517,6 +1539,12 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         with self.done_task_lock:
             if req_id in self.stored_requests:
                 del self.stored_requests[req_id]
+
+    def build_shared_data(self, task: LayerTransferTask) -> SharedBlockData | None:
+        """Build Mooncake range metadata shared by all transferred layers."""
+        if self.group_builders is None:
+            raise RuntimeError("Mooncake layer batch builders are not configured")
+        return self.group_builders[task.group_id].build_shared(task, is_save=True)
 
     def prepare_layerwise_tasks(
         self,
@@ -1559,6 +1587,164 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
     ) -> torch.Tensor:
         self.request_queue.put(req_meta)
 
+    def _remove_started_keys(self, keys: list[str]) -> None:
+        with self._put_started_keys_lock:
+            self._put_started_keys.difference_update(keys)
+
+    def _revoke_range_keys(self, keys: list[str]) -> None:
+        if not keys:
+            return
+        try:
+            results = require_aligned_batch_results(
+                "batch_revoke", keys, self.m_store.batch_revoke(keys)
+            )
+            if any(result != 0 for result in results):
+                logger.error("Layerwise revoke failed keys=%s results=%s", keys, results)
+        except Exception as exc:
+            logger.error("Layerwise revoke raised keys=%s error=%s", keys, exc)
+        finally:
+            # This tracker only gates future put-start calls. Drop keys after a
+            # revoke attempt even when the remote cleanup fails; the Master TTL
+            # owns any remaining PROCESSING session.
+            self._remove_started_keys(keys)
+
+    def _handle_range_request(self, req_meta: LayerRangeReqMeta) -> None:
+        layer_id = req_meta.layer_id
+        if self._active_put_keys is None or layer_id == 0:
+            # This mutable set is scoped to one forward batch. Keep the shared
+            # metadata immutable so later layers can filter failed keys safely.
+            self._active_put_keys = set(req_meta.keys)
+        active_indices = [
+            index
+            for index, key in enumerate(req_meta.keys)
+            if key in self._active_put_keys
+        ]
+        active_keys = [req_meta.keys[index] for index in active_indices]
+        if active_keys:
+            if layer_id < len(self.sync_save_events):
+                self.sync_save_events[layer_id].synchronize()
+            results = require_aligned_batch_results(
+                "batch_copy_put",
+                active_keys,
+                self.m_store.batch_copy_put(
+                    active_keys,
+                    [req_meta.all_buffers[index] for index in active_indices],
+                    [req_meta.all_sizes[index] for index in active_indices],
+                    [req_meta.all_offsets[index] for index in active_indices],
+                ),
+            )
+            failed_keys = [
+                key
+                for key, result in zip(active_keys, results, strict=True)
+                if result < 0
+            ]
+            if failed_keys:
+                # A ranged-write failure only invalidates this key; remaining
+                # active keys continue copying their later layer ranges.
+                self._revoke_range_keys(failed_keys)
+                self._active_put_keys.difference_update(failed_keys)
+
+        if layer_id == self.final_layer_id:
+            # Only keys that completed every layer range may publish COMPLETE.
+            active_keys = [
+                key for key in req_meta.keys if key in self._active_put_keys
+            ]
+            if active_keys:
+                try:
+                    commit_results = require_aligned_batch_results(
+                        "batch_commit",
+                        active_keys,
+                        self.m_store.batch_commit(active_keys),
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Layerwise commit raised keys=%s error=%s",
+                        active_keys,
+                        exc,
+                    )
+                    self._revoke_range_keys(active_keys)
+                else:
+                    failed_commit_keys = [
+                        key
+                        for key, result in zip(
+                            active_keys, commit_results, strict=True
+                        )
+                        if result != 0
+                    ]
+                    if failed_commit_keys:
+                        self._revoke_range_keys(failed_commit_keys)
+                    self._remove_started_keys(active_keys)
+            self._active_put_keys = None
+
+    def _handle_mooncake_range_save(
+        self,
+        transfer_tasks: list[LayerTransferTask],
+        layer_id: int,
+    ) -> None:
+        shared: SharedBlockData | None = None
+        try:
+            try:
+                if len(transfer_tasks) != 1:
+                    raise ValueError(
+                        f"Expected one Mooncake range task, got {len(transfer_tasks)}"
+                    )
+                task = transfer_tasks[0]
+                shared = task.shared_block_data
+                if shared is None:
+                    raise RuntimeError(
+                        f"Mooncake range metadata was not prepared for layer {layer_id}"
+                    )
+                if self.group_builders is None:
+                    raise RuntimeError("Mooncake layer batch builders are not configured")
+                builder = self.group_builders[task.group_id]
+                req_meta = builder.build_addrs(shared, task.layer_id)
+                if not isinstance(req_meta, LayerRangeReqMeta):
+                    raise TypeError(
+                        "Expected Mooncake range metadata, got "
+                        f"{type(req_meta).__name__}"
+                    )
+                self._handle_range_request(req_meta)
+            except Exception as exc:
+                logger.error(
+                    "Mooncake ranged save failed layer=%d error=%s",
+                    layer_id,
+                    exc,
+                )
+                if self._active_put_keys is not None:
+                    keys_to_revoke = (
+                        [
+                            key
+                            for key in shared.block_keys
+                            if key in self._active_put_keys
+                        ]
+                        if shared is not None and shared.block_keys is not None
+                        else sorted(self._active_put_keys)
+                    )
+                elif shared is not None and shared.block_keys is not None:
+                    keys_to_revoke = list(dict.fromkeys(shared.block_keys))
+                else:
+                    keys_to_revoke = []
+                self._revoke_range_keys(keys_to_revoke)
+                # Later layers must stay inactive after any ranged-save failure.
+                self._active_put_keys = set()
+
+            if self.pd_transfer_waiter is not None:
+                self.pd_transfer_waiter(layer_id)
+            self._wait_attention_done(layer_id)
+
+            req_ids = [
+                block_range.request.req_id
+                for task in transfer_tasks
+                for block_range in task.block_ranges
+            ]
+            for req_id in req_ids:
+                self.dec_stored_request(req_id)
+                if self.try_finish_and_delete_stored_request(req_id):
+                    self.set_finished_request(req_id)
+            self._set_slot_free(layer_id)
+        finally:
+            self._finish_layer_save_task(transfer_tasks)
+
     def _finish_layer_save_task(
         self,
         transfer_tasks: list[LayerTransferTask],
@@ -1579,6 +1765,9 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             return
         physical_layer = request.layer_id
         transfer_tasks = request.transfer_tasks
+        if transfer_tasks and any(task.use_key_major_ranges for task in transfer_tasks):
+            self._handle_mooncake_range_save(transfer_tasks, physical_layer)
+            return
         try:
             preparation = transfer_tasks[0].preparation if transfer_tasks else None
             if preparation is not None:
