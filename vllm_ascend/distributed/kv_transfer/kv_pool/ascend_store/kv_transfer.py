@@ -1559,95 +1559,116 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
     ) -> torch.Tensor:
         self.request_queue.put(req_meta)
 
+    def _finish_layer_save_task(
+        self,
+        transfer_tasks: list[LayerTransferTask],
+    ) -> None:
+        # Queue accounting is independent of transfer success. Request and
+        # layer completion are published only by the successful path below.
+        transfer_tasks.clear()
+        self.request_queue.task_done()
+
     def _handle_request(  # type: ignore[override]
         self, request: LayerSaveTask | LayerwisePreparation
     ):
         if isinstance(request, LayerwisePreparation):
-            request.ensure_ready()
-            self.request_queue.task_done()
+            try:
+                request.ensure_ready()
+            finally:
+                self.request_queue.task_done()
             return
         physical_layer = request.layer_id
         transfer_tasks = request.transfer_tasks
-        preparation = transfer_tasks[0].preparation if transfer_tasks else None
-        if preparation is not None:
-            preparation.ensure_ready()
-        has_any_save = False
-        all_gvas = []
-        all_addrs = []
-        all_sizes = []
-        all_req_ids = []
-        finished_req_ids: set[str] = set()
-        write_finish_keys: list[str] = []
-        for task in transfer_tasks:
-            if task.layer_id != physical_layer:
-                raise RuntimeError(
-                    f"Layerwise save request for layer {physical_layer} contains task for layer {task.layer_id}"
-                )
-            transfer_data = task.transfer_data
-            completion = task.completion
-            if transfer_data is None or completion is None:
-                raise RuntimeError(
-                    f"Layerwise save metadata was not prepared for layer {physical_layer}, group {task.group_id}"
-                )
-            has_any_save = True
-            builder = (
-                self.group_array_builders[task.group_id] if self.group_array_builders else self.transfer_array_builder
-            )
-            arrays = builder.build_addrs(transfer_data, task.layer_idx_in_group)
-            all_req_ids.extend(completion.req_ids)
-            finished_req_ids.update(task.finished_req_ids)
-            write_finish_keys.extend(task.write_finish_keys)
-            all_gvas.append(arrays.gvas_array)
-            all_addrs.append(arrays.addr_array)
-            all_sizes.append(arrays.size_array)
-        if has_any_save:
-            self.sync_save_events[physical_layer].synchronize()
-            gvas_array = np.concatenate(all_gvas) if len(all_gvas) > 1 else all_gvas[0]
-            addr_array = np.concatenate(all_addrs) if len(all_addrs) > 1 else all_addrs[0]
-            size_array = np.concatenate(all_sizes) if len(all_sizes) > 1 else all_sizes[0]
-            res = self._batch_copy_with_limits(
-                gvas_array,
-                addr_array,
-                size_array,
-                0,
-                self.max_transfer_blocks,
-                self.max_transfer_bytes,
-            )
-            if physical_layer <= 2 or res != 0:
-                logger.info(
-                    "save_thread: layer=%d groups=%d blocks=%d res=%d",
-                    physical_layer,
-                    len(all_gvas),
-                    len(gvas_array),
-                    res,
-                )
-            if res != 0:
-                raise RuntimeError(f"Layerwise {physical_layer} save batch_copy failed with return code {res}")
-            if write_finish_keys:
-                finish_results = self.m_store.batch_write_finish(
-                    write_finish_keys,
-                    [0] * len(write_finish_keys),
-                )
-                if len(finish_results) != len(write_finish_keys) or any(result != 0 for result in finish_results):
+        try:
+            preparation = transfer_tasks[0].preparation if transfer_tasks else None
+            if preparation is not None:
+                preparation.ensure_ready()
+
+            has_any_save = False
+            all_gvas = []
+            all_addrs = []
+            all_sizes = []
+            all_req_ids = []
+            finished_req_ids: set[str] = set()
+            write_finish_keys: list[str] = []
+            for task in transfer_tasks:
+                if task.layer_id != physical_layer:
                     raise RuntimeError(
-                        "Layerwise save batch_write_finish failed: "
-                        f"expected={len(write_finish_keys)}, results={finish_results}"
+                        f"Layerwise save request for layer {physical_layer} contains task for layer {task.layer_id}"
                     )
+                transfer_data = task.transfer_data
+                completion = task.completion
+                if transfer_data is None or completion is None:
+                    raise RuntimeError(
+                        f"Layerwise save metadata was not prepared for layer {physical_layer}, group {task.group_id}"
+                    )
+                has_any_save = True
+                builder = (
+                    self.group_array_builders[task.group_id]
+                    if self.group_array_builders
+                    else self.transfer_array_builder
+                )
+                arrays = builder.build_addrs(transfer_data, task.layer_idx_in_group)
+                all_req_ids.extend(completion.req_ids)
+                finished_req_ids.update(task.finished_req_ids)
+                write_finish_keys.extend(task.write_finish_keys)
+                all_gvas.append(arrays.gvas_array)
+                all_addrs.append(arrays.addr_array)
+                all_sizes.append(arrays.size_array)
 
-        if self.pd_transfer_waiter is not None:
-            self.pd_transfer_waiter(physical_layer)
-        self._wait_attention_done(physical_layer)
+            if has_any_save:
+                self.sync_save_events[physical_layer].synchronize()
+                gvas_array = np.concatenate(all_gvas) if len(all_gvas) > 1 else all_gvas[0]
+                addr_array = np.concatenate(all_addrs) if len(all_addrs) > 1 else all_addrs[0]
+                size_array = np.concatenate(all_sizes) if len(all_sizes) > 1 else all_sizes[0]
+                res = self._batch_copy_with_limits(
+                    gvas_array,
+                    addr_array,
+                    size_array,
+                    0,
+                    self.max_transfer_blocks,
+                    self.max_transfer_bytes,
+                )
+                if physical_layer <= 2 or res != 0:
+                    logger.info(
+                        "save_thread: layer=%d groups=%d blocks=%d res=%d",
+                        physical_layer,
+                        len(all_gvas),
+                        len(gvas_array),
+                        res,
+                    )
+                if res != 0:
+                    raise RuntimeError(f"Layerwise {physical_layer} save batch_copy failed with return code {res}")
+                if write_finish_keys:
+                    finish_results = self.m_store.batch_write_finish(
+                        write_finish_keys,
+                        [0] * len(write_finish_keys),
+                    )
+                    if len(finish_results) != len(write_finish_keys) or any(
+                        result != 0 for result in finish_results
+                    ):
+                        raise RuntimeError(
+                            "Layerwise save batch_write_finish failed: "
+                            f"expected={len(write_finish_keys)}, results={finish_results}"
+                        )
 
-        if has_any_save:
-            for req_id in all_req_ids:
-                self.dec_stored_request(req_id)
-            for req_id in finished_req_ids:
-                if self.try_finish_and_delete_stored_request(req_id):
-                    self.set_finished_request(req_id)
+            if self.pd_transfer_waiter is not None:
+                self.pd_transfer_waiter(physical_layer)
+            self._wait_attention_done(physical_layer)
 
-        self._set_slot_free(physical_layer)
-        transfer_tasks.clear()
-        self.request_queue.task_done()
+            if has_any_save:
+                for req_id in all_req_ids:
+                    self.dec_stored_request(req_id)
+                for req_id in finished_req_ids:
+                    if self.try_finish_and_delete_stored_request(req_id):
+                        self.set_finished_request(req_id)
+
+            self._set_slot_free(physical_layer)
+        except Exception as exc:
+            logger.error("Layerwise save handler failed layer=%d error=%s", physical_layer, exc)
+            raise
+        finally:
+            self._finish_layer_save_task(transfer_tasks)
 
 
 class KVCacheStoreLayerRecvingThread(KVTransferThread):
@@ -1669,6 +1690,9 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         max_transfer_bytes: int = 0,
         group_array_builders: list[LayerTransferArrayBuilder] | None = None,
         load_lease_releaser: Callable[[set[str]], None] | None = None,
+        *,
+        invalid_block_ids: set[int],
+        invalid_block_ids_lock: threading.Lock,
     ):
         super().__init__(
             m_store,
@@ -1687,6 +1711,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self.h2d_stagger_us = h2d_stagger_us
         self.max_transfer_blocks = max_transfer_blocks
         self.max_transfer_bytes = max_transfer_bytes
+        self._invalid_block_ids = invalid_block_ids
+        self._invalid_block_ids_lock = invalid_block_ids_lock
         self.group_array_builders = group_array_builders
         self.load_lease_releaser = load_lease_releaser
         if group_array_builders is not None:
@@ -1732,103 +1758,143 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         while time.perf_counter_ns() < deadline_ns:
             pass
 
+    def _mark_invalid_transfer_task_blocks(
+        self,
+        transfer_tasks: list[LayerTransferTask],
+    ) -> None:
+        block_ids: set[int] = set()
+        for task in transfer_tasks:
+            for block_range in task.block_ranges:
+                request_block_ids = block_range.request.block_ids
+                block_ids.update(
+                    request_block_ids[
+                        block_range.start_block : block_range.end_block
+                    ]
+                )
+                partial_block_index = block_range.partial_block_index
+                if partial_block_index is not None and 0 <= partial_block_index < len(request_block_ids):
+                    block_ids.add(request_block_ids[partial_block_index])
+        with self._invalid_block_ids_lock:
+            self._invalid_block_ids.update(block_ids)
+
+    def _finish_layer_load_task(
+        self,
+        data: LayerLoadTask,
+        layer_id: int,
+        succeeded: bool,
+    ) -> None:
+        try:
+            if succeeded:
+                self._set_layer_load_done(layer_id)
+                self.get_event.set()
+        finally:
+            data.transfer_tasks.clear()
+            self.request_queue.task_done()
+
     def _handle_request(  # type: ignore[override]
         self, data: LayerLoadTask | LayerwisePreparation
     ):
         if isinstance(data, LayerwisePreparation):
-            data.ensure_ready()
-            self.request_queue.task_done()
+            try:
+                data.ensure_ready()
+            finally:
+                self.request_queue.task_done()
             return
-        wait_for_save = data.wait_for_save_layer
-        transfer_tasks = data.transfer_tasks
         layer_id = data.layer_id
-        attention_start_gate = data.attention_start_gate
+        succeeded = False
+        try:
+            wait_for_save = data.wait_for_save_layer
+            transfer_tasks = data.transfer_tasks
+            attention_start_gate = data.attention_start_gate
 
-        if data.preparation is not None:
-            data.preparation.ensure_ready()
+            if data.preparation is not None:
+                data.preparation.ensure_ready()
 
-        if len(transfer_tasks) == 0:
+            if len(transfer_tasks) == 0:
+                if wait_for_save is not None:
+                    while not self.layer_save_finished_events[wait_for_save].wait(timeout=10):
+                        logger.info("Layerwise %d save wait timed out, keep waiting before load", wait_for_save)
+                    logger.debug("Layer save event cleared: layer %d", wait_for_save)
+                    self.layer_save_finished_events[wait_for_save].clear()
+                succeeded = True
+                return
+
+            # Expand each group's block IDs and base GVAs into this layer's copy
+            # arrays before waiting on the preceding save layer.
+            task_arrays: list[tuple[LayerTransferTask, LayerTransferArrays]] = []
+            for task in transfer_tasks:
+                transfer_data = task.transfer_data
+                builder = (
+                    self.group_array_builders[task.group_id]
+                    if self.group_array_builders
+                    else self.transfer_array_builder
+                )
+                if transfer_data is not None and task.completion is not None:
+                    arrays = builder.build_addrs(transfer_data, task.layer_idx_in_group)
+                else:
+                    raise RuntimeError(
+                        f"Layerwise load metadata was not prepared for layer {layer_id}, group {task.group_id}"
+                    )
+                task_arrays.append((task, arrays))
+
+            if not task_arrays:
+                succeeded = True
+                return
+
             if wait_for_save is not None:
                 while not self.layer_save_finished_events[wait_for_save].wait(timeout=10):
                     logger.info("Layerwise %d save wait timed out, keep waiting before load", wait_for_save)
                 logger.debug("Layer save event cleared: layer %d", wait_for_save)
                 self.layer_save_finished_events[wait_for_save].clear()
-            self._set_layer_load_done(layer_id)
-            self.request_queue.task_done()
-            return
 
-        # Expand each group's block IDs and base GVAs into this layer's copy
-        # arrays before waiting on the preceding save layer.
-        task_arrays: list[tuple[LayerTransferTask, LayerTransferArrays]] = []
-        for task in transfer_tasks:
-            transfer_data = task.transfer_data
-            builder = (
-                self.group_array_builders[task.group_id] if self.group_array_builders else self.transfer_array_builder
+            if attention_start_gate is not None:
+                while not attention_start_gate.wait(timeout=10):
+                    logger.info("Layerwise %d load waits for attention compute start", layer_id)
+
+            finished_req_ids: set[str] = set()
+            all_gvas = []
+            all_addrs = []
+            all_sizes = []
+            for task, arrays in task_arrays:
+                finished_req_ids.update(task.finished_req_ids)
+                all_gvas.append(arrays.gvas_array)
+                all_addrs.append(arrays.addr_array)
+                all_sizes.append(arrays.size_array)
+
+            self._stagger_h2d_submit(layer_id)
+            gvas_array = np.concatenate(all_gvas) if len(all_gvas) > 1 else all_gvas[0]
+            addr_array = np.concatenate(all_addrs) if len(all_addrs) > 1 else all_addrs[0]
+            size_array = np.concatenate(all_sizes) if len(all_sizes) > 1 else all_sizes[0]
+            res = self._batch_copy_with_limits(
+                gvas_array,
+                addr_array,
+                size_array,
+                1,
+                self.max_transfer_blocks,
+                self.max_transfer_bytes,
             )
-            if transfer_data is not None and task.completion is not None:
-                arrays = builder.build_addrs(transfer_data, task.layer_idx_in_group)
-            else:
-                raise RuntimeError(
-                    f"Layerwise load metadata was not prepared for layer {layer_id}, group {task.group_id}"
+            if layer_id <= 2 or res != 0:
+                logger.info(
+                    "load_thread: layer=%d groups=%d blocks=%d res=%d",
+                    layer_id,
+                    len(all_gvas),
+                    len(gvas_array),
+                    res,
                 )
-            task_arrays.append((task, arrays))
+            if res != 0:
+                raise RuntimeError(f"Layerwise {layer_id} load batch_copy failed with return code {res}")
 
-        if not task_arrays:
-            self._set_layer_load_done(layer_id)
-            self.request_queue.task_done()
-            return
-
-        if wait_for_save is not None:
-            while not self.layer_save_finished_events[wait_for_save].wait(timeout=10):
-                logger.info("Layerwise %d save wait timed out, keep waiting before load", wait_for_save)
-            logger.debug("Layer save event cleared: layer %d", wait_for_save)
-            self.layer_save_finished_events[wait_for_save].clear()
-
-        if attention_start_gate is not None:
-            while not attention_start_gate.wait(timeout=10):
-                logger.info("Layerwise %d load waits for attention compute start", layer_id)
-
-        finished_req_ids: set[str] = set()
-        all_gvas = []
-        all_addrs = []
-        all_sizes = []
-        for task, arrays in task_arrays:
-            finished_req_ids.update(task.finished_req_ids)
-            all_gvas.append(arrays.gvas_array)
-            all_addrs.append(arrays.addr_array)
-            all_sizes.append(arrays.size_array)
-
-        self._stagger_h2d_submit(layer_id)
-        gvas_array = np.concatenate(all_gvas) if len(all_gvas) > 1 else all_gvas[0]
-        addr_array = np.concatenate(all_addrs) if len(all_addrs) > 1 else all_addrs[0]
-        size_array = np.concatenate(all_sizes) if len(all_sizes) > 1 else all_sizes[0]
-        res = self._batch_copy_with_limits(
-            gvas_array,
-            addr_array,
-            size_array,
-            1,
-            self.max_transfer_blocks,
-            self.max_transfer_bytes,
-        )
-        if layer_id <= 2 or res != 0:
-            logger.info(
-                "load_thread: layer=%d groups=%d blocks=%d res=%d",
-                layer_id,
-                len(all_gvas),
-                len(gvas_array),
-                res,
-            )
-        if res != 0:
-            raise RuntimeError(f"Layerwise {layer_id} load batch_copy failed with return code {res}")
-
-        if finished_req_ids and self.load_lease_releaser is not None:
-            self.load_lease_releaser(finished_req_ids)
-        for req_id in finished_req_ids:
-            self.set_finished_request(req_id)
-        self._set_layer_load_done(layer_id)
-        transfer_tasks.clear()
-        self.request_queue.task_done()
-        self.get_event.set()
+            if finished_req_ids and self.load_lease_releaser is not None:
+                self.load_lease_releaser(finished_req_ids)
+            for req_id in finished_req_ids:
+                self.set_finished_request(req_id)
+            succeeded = True
+        except Exception as exc:
+            logger.error("Layerwise load handler failed layer=%d error=%s", layer_id, exc)
+            self._mark_invalid_transfer_task_blocks(data.transfer_tasks)
+            raise
+        finally:
+            self._finish_layer_load_task(data, layer_id, succeeded)
 
 
 def record_failed_blocks(

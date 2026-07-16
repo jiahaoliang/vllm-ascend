@@ -720,6 +720,41 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         self.assertEqual(worker.group_layer_offsets[0], [0, 3, 4])
         self.assertEqual(worker.group_num_layers[0], 2)
 
+    def test_layer_receiver_shares_worker_invalid_block_state(self):
+        worker = self._make_worker(
+            kv_role="kv_consumer",
+            extra_config={"backend": "memcache"},
+        )
+        worker.use_layerwise = True
+        worker.use_gva_layerwise = True
+        worker.page_size_bytes = 64
+        worker.token_database.set_group_buffers(
+            {0: [1000, 2000, 3000, 4000]},
+            {0: [32, 32, 32, 32]},
+        )
+
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
+            KVCacheStoreLayerRecvingThread,
+        )
+
+        with (
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.torch.npu",
+                create=True,
+            ),
+            patch.object(KVCacheStoreLayerRecvingThread, "start"),
+            patch.object(threading.Event, "wait", return_value=True),
+        ):
+            worker._start_kv_transfer_threads()
+
+        recv_thread = worker.kv_recv_thread
+        self.assertIsInstance(recv_thread, KVCacheStoreLayerRecvingThread)
+        self.assertIs(recv_thread._invalid_block_ids, worker._invalid_block_ids)
+        self.assertIs(recv_thread._invalid_block_ids_lock, worker._invalid_block_ids_lock)
+
+        recv_thread._invalid_block_ids.add(7)
+        self.assertEqual(worker.get_block_ids_with_load_errors(), {7})
+
     def test_start_load_kv_sync(self):
         worker = self._make_worker()
         worker.m_store.get = MagicMock()
