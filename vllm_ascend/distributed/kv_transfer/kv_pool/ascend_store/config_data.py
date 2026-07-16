@@ -1076,6 +1076,17 @@ class LayerTransferArrays:
 
 
 @dataclass
+class LayerBatchReqMeta:
+    req_ids: list[str]
+    layer_id: int
+    is_last_chunks: list[bool | None] = field(default_factory=list)
+    addr_array: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
+    size_array: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
+    gvas_array: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
+    load_keys: list[str] = field(default_factory=list)
+
+
+@dataclass
 class LayerRangeReqMeta:
     req_ids: list[str]
     layer_id: int
