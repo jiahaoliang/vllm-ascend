@@ -27,6 +27,14 @@ from typing import Any
 
 # begin-env-vars-definition
 
+
+def _strict_binary_env(name: str, default: str = "0") -> bool:
+    value = os.getenv(name, default)
+    if value not in {"0", "1"}:
+        raise ValueError(f"{name} must be either '0' or '1', got {value!r}")
+    return value == "1"
+
+
 env_variables: dict[str, Callable[[], Any]] = {
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
@@ -110,6 +118,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Enable non-sensitive MemFabric KV checksum verification. 0 disables it
     # (default); 1 enables it and incurs device-to-host synchronization.
     "VLLM_ASCEND_MF_VERIFY": lambda: bool(int(os.getenv("VLLM_ASCEND_MF_VERIFY", "0"))),
+    # Emit per-layer KVPool ranged transfer audit events. Default: 0 (disabled).
+    # Valid values: 0 or 1. This configuration is not sensitive.
+    "VLLM_ASCEND_KVPOOL_RANGE_DEBUG": lambda: _strict_binary_env("VLLM_ASCEND_KVPOOL_RANGE_DEBUG"),
 }
 
 # end-env-vars-definition
