@@ -13,6 +13,7 @@ from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_utils import BlockHash, BlockHashList
 from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.kv_cache_interface import MambaSpec, UniformTypeKVCacheSpecs
 
 from vllm_ascend.memcache_comm_fence import AttentionComputeStartGate
 
@@ -25,7 +26,11 @@ def make_layerwise_block_key(
     model_name: str,
     block_hash_or_tail: str,
     head_or_tp_rank: int,
+    *,
+    group_id: int | None = None,
 ) -> str:
+    if group_id is not None:
+        return f"{model_name}@{group_id}@{block_hash_or_tail}@{head_or_tp_rank}"
     return f"{model_name}@{block_hash_or_tail}@{head_or_tp_rank}"
 
 
@@ -302,6 +307,25 @@ def infer_group_cache_families(
             )
             families.append("mixed")
     return families
+
+
+def infer_group_uses_align_state(
+    kv_cache_groups: Sequence[Any] | None,
+) -> list[bool]:
+    if kv_cache_groups is None:
+        return [False]
+
+    group_uses_align_state: list[bool] = []
+    for group in kv_cache_groups:
+        kv_cache_spec = group.kv_cache_spec
+        if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+            specs = [kv_cache_spec.kv_cache_specs[layer_name] for layer_name in group.layer_names]
+        else:
+            specs = [kv_cache_spec]
+        group_uses_align_state.append(
+            any(isinstance(spec, MambaSpec) and getattr(spec, "mamba_cache_mode", None) == "align" for spec in specs)
+        )
+    return group_uses_align_state
 
 
 class ChunkedTokenDatabase:
@@ -814,6 +838,30 @@ class RequestTracker:
                 ] * mask_spec_count
 
 
+@dataclass
+class GroupBlockKeys:
+    block_keys: list[str | None] = field(default_factory=list)
+    block_offset: int = 0
+    last_block_key: str | None = None
+    last_block_index: int | None = None
+
+
+def _copy_group_block_keys(
+    keys_by_group: Mapping[int, GroupBlockKeys] | None,
+) -> dict[int, GroupBlockKeys]:
+    if keys_by_group is None:
+        return {}
+    return {
+        group_id: GroupBlockKeys(
+            block_keys=list(group_keys.block_keys),
+            block_offset=group_keys.block_offset,
+            last_block_key=group_keys.last_block_key,
+            last_block_index=group_keys.last_block_index,
+        )
+        for group_id, group_keys in keys_by_group.items()
+    }
+
+
 @dataclass(init=False)
 class ReqMeta:
     # Request id
@@ -850,12 +898,8 @@ class ReqMeta:
 
     event_id: int | None = None
 
-    save_block_keys: list[str | None]
-    save_key_block_offset: int
-    save_last_block_key: str | None
-    load_block_keys: list[str | None]
-    load_key_block_offset: int
-    load_last_block_key: str | None
+    save_keys_by_group: dict[int, GroupBlockKeys]
+    load_keys_by_group: dict[int, GroupBlockKeys]
     load_keys: list[str]
 
     def __init__(
@@ -900,6 +944,8 @@ class ReqMeta:
         load_key_block_offset: int = 0,
         load_last_block_key: str | None = None,
         load_keys: list[str] | None = None,
+        save_keys_by_group: Mapping[int, GroupBlockKeys] | None = None,
+        load_keys_by_group: Mapping[int, GroupBlockKeys] | None = None,
     ) -> None:
         if token_len_chunk is None:
             token_len_chunk = 0 if save_end_token is None else save_end_token
@@ -939,13 +985,86 @@ class ReqMeta:
         self.load_block_gvas_np = load_block_gvas_np
         self.load_block_gvas_by_group_np = load_block_gvas_by_group_np
         self.load_gva_block_offset = load_gva_block_offset
-        self.save_block_keys = [] if save_block_keys is None else list(save_block_keys)
-        self.save_key_block_offset = save_key_block_offset
-        self.save_last_block_key = save_last_block_key
-        self.load_block_keys = [] if load_block_keys is None else list(load_block_keys)
-        self.load_key_block_offset = load_key_block_offset
-        self.load_last_block_key = load_last_block_key
+        self.save_keys_by_group = _copy_group_block_keys(save_keys_by_group)
+        if (
+            0 not in self.save_keys_by_group
+            or save_block_keys is not None
+            or save_key_block_offset != 0
+            or save_last_block_key is not None
+        ):
+            self.save_keys_by_group[0] = GroupBlockKeys(
+                block_keys=[] if save_block_keys is None else list(save_block_keys),
+                block_offset=save_key_block_offset,
+                last_block_key=save_last_block_key,
+                last_block_index=partial_block_index,
+            )
+        self.load_keys_by_group = _copy_group_block_keys(load_keys_by_group)
+        if (
+            0 not in self.load_keys_by_group
+            or load_block_keys is not None
+            or load_key_block_offset != 0
+            or load_last_block_key is not None
+        ):
+            self.load_keys_by_group[0] = GroupBlockKeys(
+                block_keys=[] if load_block_keys is None else list(load_block_keys),
+                block_offset=load_key_block_offset,
+                last_block_key=load_last_block_key,
+            )
         self.load_keys = [] if load_keys is None else list(load_keys)
+
+    def _group_zero_save_keys(self) -> GroupBlockKeys:
+        return self.save_keys_by_group.setdefault(0, GroupBlockKeys())
+
+    def _group_zero_load_keys(self) -> GroupBlockKeys:
+        return self.load_keys_by_group.setdefault(0, GroupBlockKeys())
+
+    @property
+    def save_block_keys(self) -> list[str | None]:
+        return self._group_zero_save_keys().block_keys
+
+    @save_block_keys.setter
+    def save_block_keys(self, block_keys: list[str | None]) -> None:
+        self._group_zero_save_keys().block_keys = list(block_keys)
+
+    @property
+    def save_key_block_offset(self) -> int:
+        return self._group_zero_save_keys().block_offset
+
+    @save_key_block_offset.setter
+    def save_key_block_offset(self, block_offset: int) -> None:
+        self._group_zero_save_keys().block_offset = block_offset
+
+    @property
+    def save_last_block_key(self) -> str | None:
+        return self._group_zero_save_keys().last_block_key
+
+    @save_last_block_key.setter
+    def save_last_block_key(self, key: str | None) -> None:
+        self._group_zero_save_keys().last_block_key = key
+
+    @property
+    def load_block_keys(self) -> list[str | None]:
+        return self._group_zero_load_keys().block_keys
+
+    @load_block_keys.setter
+    def load_block_keys(self, block_keys: list[str | None]) -> None:
+        self._group_zero_load_keys().block_keys = list(block_keys)
+
+    @property
+    def load_key_block_offset(self) -> int:
+        return self._group_zero_load_keys().block_offset
+
+    @load_key_block_offset.setter
+    def load_key_block_offset(self, block_offset: int) -> None:
+        self._group_zero_load_keys().block_offset = block_offset
+
+    @property
+    def load_last_block_key(self) -> str | None:
+        return self._group_zero_load_keys().last_block_key
+
+    @load_last_block_key.setter
+    def load_last_block_key(self, key: str | None) -> None:
+        self._group_zero_load_keys().last_block_key = key
 
     @property
     def block_ids(self) -> list[int]:
@@ -1100,6 +1219,7 @@ class LayerRangeReqMeta:
     all_offsets: list[list[int]]
     load_keys: list[str] = field(default_factory=list)
     row_req_ids: list[str] = field(default_factory=list)
+    group_id: int = 0
 
 
 @dataclass

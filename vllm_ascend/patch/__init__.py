@@ -275,6 +275,23 @@
 #       Drop the alias once upstream registry includes it or the checkpoint
 #       standardizes architecture strings.
 #
+# ** 11a. File: platform/patch_group_block_failures.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.v1.core.sched.scheduler.Scheduler._handle_invalid_blocks`
+#    Why:
+#       Upstream failure metadata identifies blocks with a single integer and
+#       cannot distinguish the same block ID in different KV-cache groups.
+#    How:
+#       Decode vLLM-Ascend's private negative group/block IDs and match them
+#       against each request's exact group block table. Nonnegative IDs retain
+#       the upstream behavior; encoded IDs neither truncate tokens nor evict
+#       blocks before the existing failure-policy path finishes the requests.
+#    Related PR (if no, explain why):
+#       No. This supports vLLM-Ascend's multi-group AscendStore metadata.
+#    Future Plan:
+#       Remove this patch when upstream failure metadata carries KV-cache group
+#       identity and supports hybrid group tables.
+#
 # ** 12. File: platform/patch_mla_prefill_backend.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.v1.attention.backends.mla.common.get_mla_prefill_backend`

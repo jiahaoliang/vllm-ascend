@@ -32,6 +32,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import (
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
     GroupBatchPlan,
+    GroupBlockKeys,
     GroupTransferData,
     KeyMetadata,
     LayerBlockRange,
@@ -414,6 +415,30 @@ class RangeBatchFakeTokenDatabase(FakeTokenDatabase):
         self.group_block_stride = {0: [100, 50, 100, 50, 100, 50]}
 
 
+class UnevenTupleTokenDatabase(FakeTokenDatabase):
+    def __init__(self):
+        super().__init__()
+        self.group_block_len = [[16, 8, 32, 4]]
+        self.group_kv_caches_base_addr = [[100, 200, 300, 400]]
+        self.group_block_stride = {0: [10, 20, 30, 40]}
+
+
+class TwoGroupRangeTokenDatabase(FakeTokenDatabase):
+    def __init__(self):
+        super().__init__()
+        self.group_block_len = [[16, 16], [8]]
+        self.group_kv_caches_base_addr = [[100, 200], [300]]
+        self.group_block_stride = {0: [10, 10], 1: [20]}
+
+
+class VariableTupleTokenDatabase(FakeTokenDatabase):
+    def __init__(self):
+        super().__init__()
+        self.group_block_len = [[16, 8, 32]]
+        self.group_kv_caches_base_addr = [[100, 200, 300]]
+        self.group_block_stride = {0: [10, 20, 30]}
+
+
 class TestLayerBatchBuilder(unittest.TestCase):
     def setUp(self):
         self.builder = LayerBatchBuilder(
@@ -470,6 +495,63 @@ class TestLayerBatchBuilder(unittest.TestCase):
         self.assertEqual(batch.all_buffers, [[1100, 2050], [1200, 2100]])
         self.assertEqual(batch.all_sizes, [[64, 32], [64, 32]])
         self.assertEqual(batch.all_offsets, [[192, 256], [192, 256]])
+
+    def test_uses_exact_tuple_prefix_offsets_and_exposes_object_size(self):
+        builder = LayerBatchBuilder(
+            UnevenTupleTokenDatabase(),
+            my_key_index=0,
+            num_ranks_per_layer=1,
+            page_size_bytes=30,
+            num_layers=2,
+        )
+        request = ReqMeta(
+            req_id="r1",
+            block_ids=[1],
+            save_block_keys=["key-1"],
+        )
+        task = LayerTransferTask(
+            layer_id=1,
+            block_ranges=[LayerBlockRange(request, 0, 1)],
+            use_key_major_ranges=True,
+        )
+
+        batch = builder.build(task)
+
+        self.assertEqual(builder.object_size, 60)
+        self.assertIsInstance(batch, LayerRangeReqMeta)
+        assert isinstance(batch, LayerRangeReqMeta)
+        self.assertEqual(batch.all_sizes, [[32, 4]])
+        self.assertEqual(batch.all_offsets, [[24, 56]])
+        self.assertEqual(batch.all_buffers, [[330, 440]])
+
+    def test_layer_tuples_can_cover_different_numbers_of_cache_entries(self):
+        builder = LayerBatchBuilder(
+            VariableTupleTokenDatabase(),
+            my_key_index=0,
+            num_ranks_per_layer=1,
+            page_size_bytes=24,
+            num_layers=2,
+            layer_entry_indices=((0, 1), (2,)),
+        )
+        request = ReqMeta(
+            req_id="r1",
+            block_ids=[1],
+            save_block_keys=["key-1"],
+        )
+        task = LayerTransferTask(
+            layer_id=1,
+            block_ranges=[LayerBlockRange(request, 0, 1)],
+            use_key_major_ranges=True,
+        )
+
+        batch = builder.build(task)
+
+        self.assertEqual(builder.object_size, 56)
+        self.assertIsInstance(batch, LayerRangeReqMeta)
+        assert isinstance(batch, LayerRangeReqMeta)
+        self.assertEqual(batch.all_sizes, [[32]])
+        self.assertEqual(batch.all_offsets, [[24]])
+        self.assertEqual(batch.all_buffers, [[330]])
 
     def test_reuses_key_major_shared_data_across_layers(self):
         request = ReqMeta(
@@ -1712,11 +1794,79 @@ class TestKVCacheStoreLayerSendingThread(unittest.TestCase):
                 ["key-1"],
                 [[650, 1100, 2050]],
                 [[32, 64, 32]],
-                [[96, 128, 192]],
+                [[160, 192, 256]],
             ),
         )
         self.assertEqual(store.revoke_calls, [["key-2"]])
         self.assertEqual(store.commit_calls, [["key-1"]])
+        self.assertEqual(started_keys, set())
+
+    def test_multi_group_tasks_commit_and_revoke_at_independent_boundaries(self):
+        database = TwoGroupRangeTokenDatabase()
+        builders = [
+            LayerBatchBuilder(database, 0, 1, 16, 2, group_id=0),
+            LayerBatchBuilder(database, 0, 1, 8, 1, group_id=1),
+        ]
+        store = FakeStore()
+        started_keys = {"g0-key", "g1-key"}
+        thread = KVCacheStoreLayerSendingThread(
+            m_store=store,
+            token_database=database,
+            block_size=[16, 32],
+            tp_rank=0,
+            tp_size=1,
+            dcp_size=1,
+            put_step=1,
+            ready_event=threading.Event(),
+            num_layers=2,
+            layer_save_finished_events=[threading.Event(), threading.Event()],
+            sync_save_events=[MagicMock(), MagicMock()],
+            group_builders=builders,
+            put_started_keys=started_keys,
+            put_started_keys_lock=threading.Lock(),
+        )
+        request = ReqMeta(
+            req_id="r1",
+            block_ids_by_group=[[1], [2]],
+            save_keys_by_group={
+                0: GroupBlockKeys(["g0-key"]),
+                1: GroupBlockKeys(["g1-key"]),
+            },
+            is_last_chunk=True,
+        )
+
+        def make_task(physical_layer, group_id, local_layer):
+            task = LayerTransferTask(
+                physical_layer,
+                [LayerBlockRange(request, 0, 1)],
+                group_id=group_id,
+                layer_idx_in_group=local_layer,
+                use_key_major_ranges=True,
+            )
+            task.shared_block_data = builders[group_id].build_shared(task)
+            return task
+
+        physical_zero_tasks = [make_task(0, 0, 0), make_task(0, 1, 0)]
+        store.copy_put_results = [[16], [-1], [16]]
+        store.revoke_results = [[0]]
+        for task in physical_zero_tasks:
+            thread.add_stored_request(request.req_id)
+        physical_zero = LayerSaveTask(0, physical_zero_tasks)
+        thread.request_queue.put(physical_zero)
+        thread._handle_request(physical_zero)
+
+        physical_one_tasks = [make_task(1, 0, 1)]
+        thread.add_stored_request(request.req_id)
+        physical_one = LayerSaveTask(1, physical_one_tasks)
+        thread.request_queue.put(physical_one)
+        thread._handle_request(physical_one)
+
+        self.assertEqual(
+            [call[0] for call in store.copy_put_calls],
+            [["g0-key"], ["g1-key"], ["g0-key"]],
+        )
+        self.assertEqual(store.revoke_calls, [["g1-key"]])
+        self.assertEqual(store.commit_calls, [["g0-key"]])
         self.assertEqual(started_keys, set())
 
     def test_range_debug_records_physical_save_layers_and_final_commit(self):
@@ -1946,6 +2096,7 @@ class TestKVCacheStoreLayerSendingThread(unittest.TestCase):
 
     def test_control_revoke_runs_on_sending_thread_and_clears_trackers(self):
         thread, store, started_keys = self._make_thread()
+        thread._put_pending_revoke_keys.add("key-1")
         tracker = MooncakeSessionTracker()
         tracker.register_put_keys("r1", [("key-1", 0)])
         thread._session_tracker = tracker
@@ -1957,6 +2108,7 @@ class TestKVCacheStoreLayerSendingThread(unittest.TestCase):
 
         self.assertEqual(store.revoke_calls, [["key-1"]])
         self.assertEqual(started_keys, {"key-2"})
+        self.assertEqual(thread._put_pending_revoke_keys, set())
         self.assertEqual(tracker.prepare_load_entries("r1", []), [])
         self.assertEqual(thread.request_queue.unfinished_tasks, 0)
 
@@ -2090,10 +2242,91 @@ class TestKVCacheStoreLayerRecvingThread(unittest.TestCase):
                 ["key-3"],
                 [[750, 1300, 2150]],
                 [[32, 64, 32]],
-                [[96, 128, 192]],
+                [[160, 192, 256]],
             ),
         )
         self.assertEqual(invalid_block_ids, {4})
+        self.assertFalse(load_abort_event.is_set())
+
+    def test_aborted_prefetched_layer_skips_later_range_call(self):
+        thread, store, invalid_block_ids, _, load_abort_event = self._make_thread()
+        store.copy_get_results = [[96, 96]]
+
+        self._run_task(thread, self._make_load_task(thread, 0))
+        load_abort_event.set()
+        self._run_task(thread, self._make_load_task(thread, 1))
+
+        self.assertEqual(len(store.copy_get_calls), 1)
+        self.assertEqual(invalid_block_ids, set())
+
+    def test_multi_group_read_failure_isolated_to_encoded_group_block(self):
+        database = TwoGroupRangeTokenDatabase()
+        builders = [
+            LayerBatchBuilder(database, 0, 1, 16, 2, group_id=0),
+            LayerBatchBuilder(database, 0, 1, 8, 1, group_id=1),
+        ]
+        store = FakeStore()
+        invalid_block_ids: set[int] = set()
+        load_abort_event = threading.Event()
+        thread = KVCacheStoreLayerRecvingThread(
+            m_store=store,
+            token_database=database,
+            block_size=[16, 32],
+            tp_rank=0,
+            tp_size=1,
+            dcp_size=1,
+            ready_event=threading.Event(),
+            get_event=threading.Event(),
+            layer_load_finished_events=[threading.Event(), threading.Event()],
+            layer_save_finished_events=[threading.Event(), threading.Event()],
+            num_layers=2,
+            group_builders=builders,
+            invalid_block_ids=invalid_block_ids,
+            invalid_block_ids_lock=threading.Lock(),
+            load_abort_event=load_abort_event,
+        )
+        request = ReqMeta(
+            req_id="r1",
+            block_ids_by_group=[[1], [2]],
+            load_keys_by_group={
+                0: GroupBlockKeys(["g0-key"]),
+                1: GroupBlockKeys(["g1-key"]),
+            },
+            load_keys=["g0-key", "g1-key"],
+            is_last_chunk=True,
+        )
+
+        def make_task(physical_layer, group_id, local_layer):
+            task = LayerTransferTask(
+                physical_layer,
+                [LayerBlockRange(request, 0, 1)],
+                group_id=group_id,
+                layer_idx_in_group=local_layer,
+                use_key_major_ranges=True,
+            )
+            task.shared_block_data = builders[group_id].build_shared(
+                task,
+                is_save=False,
+            )
+            return task
+
+        store.copy_get_results = [[16], [-1], [16]]
+        physical_zero = LayerLoadTask(
+            None,
+            [make_task(0, 0, 0), make_task(0, 1, 0)],
+            0,
+        )
+        thread.request_queue.put(physical_zero)
+        thread._handle_request(physical_zero)
+        physical_one = LayerLoadTask(None, [make_task(1, 0, 1)], 1)
+        thread.request_queue.put(physical_one)
+        thread._handle_request(physical_one)
+
+        self.assertEqual(
+            [call[0] for call in store.copy_get_calls],
+            [["g0-key"], ["g1-key"], ["g0-key"]],
+        )
+        self.assertEqual(invalid_block_ids, {-4_294_967_299})
         self.assertFalse(load_abort_event.is_set())
 
     def test_range_debug_records_physical_load_layers(self):
@@ -2157,7 +2390,7 @@ class TestKVCacheStoreLayerRecvingThread(unittest.TestCase):
                 ["shared-key"],
                 [[750, 1300, 2150]],
                 [[32, 64, 32]],
-                [[96, 128, 192]],
+                [[160, 192, 256]],
             ),
         )
         self.assertEqual(invalid_block_ids, {4})

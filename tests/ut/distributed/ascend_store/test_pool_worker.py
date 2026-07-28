@@ -21,14 +21,22 @@ from unittest.mock import MagicMock, call, patch
 
 import numpy as np
 
+# isort: off
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
+from vllm.v1.kv_cache_interface import FullAttentionSpec  # noqa: E402
+
+# isort: on
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
     AscendConnectorMetadata,
+    GroupBlockKeys,
     LayerBlockRange,
     LayerSaveTask,
     LayerTransferTask,
     LoadSpec,
     ReqMeta,
+)
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
+    LayerBatchBuilder,
 )
 
 
@@ -275,6 +283,7 @@ class TestKVPoolWorkerThreadSelection(unittest.TestCase):
         worker = object.__new__(KVPoolWorker)
         worker._transfer_threads_started = False
         worker.use_layerwise = use_layerwise
+        worker.backend_name = backend_name
         worker.use_block_key_layerwise = is_block_key_layerwise(use_layerwise, backend_name)
         worker.use_memcache_gva_layerwise = worker.use_block_key_layerwise and backend_name == "memcache"
         worker.kv_role = kv_role
@@ -284,16 +293,21 @@ class TestKVPoolWorkerThreadSelection(unittest.TestCase):
         worker.enable_kv_events = False
         worker.m_store = MagicMock()
         worker.token_database = MagicMock()
+        worker.token_database.group_block_len = [[16, 16]]
+        worker.token_database.group_kv_caches_base_addr = [[100, 200]]
+        worker.token_database.group_block_stride = {0: [16, 16]}
         worker.block_size = 16
         worker.tp_rank = 0
         worker.tp_size = 1
         worker.dcp_size = 1
         worker.put_step = 1
         worker.num_layers = 2
+        worker.physical_layer_to_group_layers = {0: [(0, 0)], 1: [(0, 1)]}
         worker.h2d_stagger_us = 0
         worker.layerwise_max_transfer_blocks = 0
         worker.layerwise_max_transfer_bytes = 0
         worker._put_started_keys = set()
+        worker._put_pending_revoke_keys = set()
         worker._put_started_keys_lock = threading.Lock()
         worker._mooncake_session_tracker = MooncakeSessionTracker()
         worker._invalid_block_ids = set()
@@ -757,6 +771,7 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         worker.group_block_len = {}
         worker.group_block_stride = {}
         worker.group_layer_offsets = {}
+        worker.group_layer_entry_indices = {}
         worker.group_num_layers = {}
 
         def make_cache(address, block_len):
@@ -794,6 +809,7 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         worker.group_block_len = {}
         worker.group_block_stride = {}
         worker.group_layer_offsets = {}
+        worker.group_layer_entry_indices = {}
         worker.group_num_layers = {}
 
         def make_cache(address, block_len):
@@ -1056,6 +1072,25 @@ class TestKVPoolWorkerStaticHelpers(unittest.TestCase):
         kv_cache_config = MagicMock()
         kv_cache_config.kv_cache_groups = [MagicMock()]
         self.assertFalse(KVPoolWorker._uses_hybrid_kv_cache(vllm_config, kv_cache_config))
+
+    def test_uses_hybrid_kv_cache_multiple_full_attention_groups(self):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
+
+        vllm_config = MagicMock()
+        vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = False
+        full_attention = MagicMock(spec=FullAttentionSpec)
+        kv_cache_config = MagicMock()
+        kv_cache_config.kv_cache_groups = [
+            MagicMock(kv_cache_spec=full_attention),
+            MagicMock(kv_cache_spec=full_attention),
+        ]
+
+        self.assertTrue(
+            KVPoolWorker._uses_hybrid_kv_cache(
+                vllm_config,
+                kv_cache_config,
+            )
+        )
 
     def test_uses_mamba_kv_cache_false_when_not_hybrid(self):
         from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
@@ -1755,6 +1790,7 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
             block_ids=[10],
             can_save=True,
             partial_block_index=0,
+            save_last_block_key="key-tail",
             load_spec=LoadSpec(0, 8, True, 8),
             load_block_keys=["key-tail"],
         )
@@ -2738,7 +2774,10 @@ class TestKVPoolWorkerMooncakeLayerSessions(unittest.TestCase):
         from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mooncake_session_tracker import (
             MooncakeSessionTracker,
         )
-        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import (
+            KVPoolWorker,
+            MooncakeLayerwiseGroupPlan,
+        )
 
         worker = object.__new__(KVPoolWorker)
         worker.backend_name = "mooncake"
@@ -2766,6 +2805,7 @@ class TestKVPoolWorkerMooncakeLayerSessions(unittest.TestCase):
         worker._scatter_cursor = 0
         worker._layerwise_pd_transfer_waiter = None
         worker._put_started_keys = set()
+        worker._put_pending_revoke_keys = set()
         worker._put_started_keys_lock = threading.Lock()
         worker._mooncake_session_tracker = MooncakeSessionTracker()
         worker._invalid_block_ids = set()
@@ -2774,6 +2814,20 @@ class TestKVPoolWorkerMooncakeLayerSessions(unittest.TestCase):
         worker._layer_load_aborted = threading.Event()
         worker._current_mooncake_request_ids = set()
         worker._current_mooncake_last_chunk_req_ids = set()
+        worker.group_uses_align_state = [False]
+        worker.mooncake_layerwise_group_plans = (
+            MooncakeLayerwiseGroupPlan(
+                group_id=0,
+                effective_block_size=16,
+                object_size=128,
+                num_group_layers=2,
+                physical_to_local_layers=((0, 0), (1, 1)),
+                final_local_layer=1,
+            ),
+        )
+        worker.token_database = MagicMock()
+        worker.token_database.store_mask.return_value = None
+        worker.token_database.load_mask.return_value = None
         worker.m_store = MagicMock()
         worker.kv_send_thread = MagicMock()
         worker.kv_recv_thread = MagicMock()
@@ -2834,6 +2888,316 @@ class TestKVPoolWorkerMooncakeLayerSessions(unittest.TestCase):
             plans[0].full_load_ranges[0].end_block,
             2,
         )
+
+    def test_group_plans_use_registered_entry_layout_and_physical_mapping(self):
+        worker = self._make_worker()
+        worker.num_kv_cache_groups = 2
+        worker.num_layers = 3
+        worker.my_key_index = 0
+        worker.num_ranks_per_layer = 1
+        worker.grouped_block_size = [16, 32]
+        worker.kv_cache_group_families = ["default", "default"]
+        worker.group_num_layers = {0: 2, 1: 1}
+        worker.group_block_len = {0: [16, 8, 32], 1: [64]}
+        worker.group_layer_entry_indices = {0: ((0, 1), (2,)), 1: ((0,),)}
+        worker.physical_layer_to_group_layers = {
+            0: [(0, 0), (1, 0)],
+            2: [(0, 1)],
+        }
+        worker.token_database = MagicMock()
+        worker.token_database.group_block_len = [[16, 8, 32], [64]]
+        worker.token_database.group_kv_caches_base_addr = [
+            [100, 200, 300],
+            [400],
+        ]
+        worker.token_database.group_block_stride = {
+            0: [10, 20, 30],
+            1: [40],
+        }
+
+        builders = worker._build_group_layer_builders()
+
+        self.assertEqual([builder.object_size for builder in builders], [56, 64])
+        self.assertEqual(
+            worker.mooncake_layerwise_group_plans[0].physical_to_local_layers,
+            ((0, 0), (2, 1)),
+        )
+        self.assertEqual(
+            worker.mooncake_layerwise_group_plans[0].final_local_layer,
+            1,
+        )
+        self.assertEqual(
+            worker.mooncake_layerwise_group_plans[1].physical_to_local_layers,
+            ((0, 0),),
+        )
+        self.assertEqual(
+            worker.mooncake_layerwise_group_plans[1].effective_block_size,
+            32,
+        )
+
+    def test_missing_group_plan_fails_closed(self):
+        worker = self._make_worker()
+        worker.mooncake_layerwise_group_plans = ()
+
+        with self.assertRaisesRegex(ValueError, "missing Mooncake layerwise plan"):
+            worker._get_mooncake_group_plan(0)
+
+    def test_multi_group_store_mask_maps_logical_key_to_clipped_block_table(self):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import (
+            MooncakeLayerwiseGroupPlan,
+        )
+
+        worker = self._make_worker()
+        worker.num_kv_cache_groups = 2
+        worker.grouped_block_size = [16, 16]
+        worker.kv_cache_group_families = ["default", "default"]
+        worker.group_uses_align_state = [False, False]
+        worker.hash_block_size = 16
+        worker.mooncake_layerwise_group_plans = (
+            MooncakeLayerwiseGroupPlan(0, 16, 64, 1, ((0, 0),), 0),
+            MooncakeLayerwiseGroupPlan(1, 16, 96, 1, ((0, 0),), 0),
+        )
+        worker.token_database.store_mask.return_value = (
+            [False, False, False, False],
+            [False, False, False, True],
+        )
+        worker.token_database.group_block_len = [[64], [96]]
+        worker.token_database.group_kv_caches_base_addr = [[100], [200]]
+        worker.token_database.group_block_stride = {0: [64], 1: [96]}
+        worker.m_store.batch_put_start.return_value = [0]
+        request = ReqMeta(
+            req_id="r1",
+            token_len_chunk=64,
+            target_token_len=64,
+            block_ids_by_group=[[10, 11, 12, 13], [20, 21]],
+            block_hashes=[b"\x0a", b"\x0b", b"\x0c", b"\x0d"],
+            can_save=True,
+            num_prompt_tokens=64,
+        )
+
+        worker.num_layers = 1
+        worker.physical_layer_to_group_layers = {0: [(0, 0), (1, 0)]}
+        worker.process_layer_data([request])
+
+        worker.m_store.batch_put_start.assert_called_once_with(
+            ["model@1@0d@0"],
+            [96],
+        )
+        self.assertEqual(
+            request.save_keys_by_group[1],
+            GroupBlockKeys(["model@1@0d@0"], block_offset=1),
+        )
+        task = worker.layer_save_tasks[0][0]
+        block_range = task.block_ranges[0]
+        self.assertEqual((block_range.start_block, block_range.end_block), (1, 2))
+
+        shared = LayerBatchBuilder(
+            worker.token_database,
+            my_key_index=0,
+            num_ranks_per_layer=1,
+            page_size_bytes=96,
+            num_layers=1,
+            group_id=1,
+        ).build_shared(task)
+
+        self.assertIsNotNone(shared)
+        assert shared is not None
+        self.assertEqual(shared.block_ids_arr.tolist(), [21])
+        self.assertEqual(shared.block_keys, ["model@1@0d@0"])
+
+    def test_multi_group_load_mask_maps_logical_key_to_clipped_block_table(self):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import (
+            MooncakeLayerwiseGroupPlan,
+        )
+
+        worker = self._make_worker()
+        worker.num_kv_cache_groups = 2
+        worker.grouped_block_size = [16, 16]
+        worker.kv_cache_group_families = ["default", "default"]
+        worker.group_uses_align_state = [False, False]
+        worker.hash_block_size = 16
+        worker.mooncake_layerwise_group_plans = (
+            MooncakeLayerwiseGroupPlan(0, 16, 64, 1, ((0, 0),), 0),
+            MooncakeLayerwiseGroupPlan(1, 16, 96, 1, ((0, 0),), 0),
+        )
+        worker.token_database.load_mask.return_value = (
+            [False, False, False, False],
+            [False, False, False, True],
+        )
+        worker.m_store.batch_get_start.return_value = [0]
+        request = ReqMeta(
+            req_id="r1",
+            token_len_chunk=64,
+            target_token_len=64,
+            block_ids_by_group=[[10, 11, 12, 13], [20, 21]],
+            block_hashes=[b"\x0a", b"\x0b", b"\x0c", b"\x0d"],
+            can_save=False,
+            load_spec=LoadSpec(0, 64, True, 64),
+        )
+
+        worker.num_layers = 1
+        worker.physical_layer_to_group_layers = {0: [(0, 0), (1, 0)]}
+        worker.process_layer_data([request])
+
+        worker.m_store.batch_get_start.assert_called_once_with(["model@1@0d@0"])
+        self.assertEqual(
+            request.load_keys_by_group[1],
+            GroupBlockKeys([None, "model@1@0d@0"]),
+        )
+        block_range = worker.layer_load_tasks[0][0].block_ranges[0]
+        self.assertEqual((block_range.start_block, block_range.end_block), (1, 2))
+
+    def test_multi_group_load_mask_uses_cached_prefix_length(self):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import (
+            MooncakeLayerwiseGroupPlan,
+        )
+
+        worker = self._make_worker()
+        worker.num_kv_cache_groups = 2
+        worker.hash_block_size = 16
+        worker.group_uses_align_state = [False, False]
+        worker.mooncake_layerwise_group_plans = (
+            MooncakeLayerwiseGroupPlan(0, 16, 64, 1, ((0, 0),), 0),
+            MooncakeLayerwiseGroupPlan(1, 16, 96, 1, ((0, 0),), 0),
+        )
+        worker.token_database.load_mask.return_value = (
+            [False, False, False, False],
+            [False, False, False, False],
+        )
+        request = ReqMeta(
+            req_id="r1",
+            token_len_chunk=80,
+            target_token_len=80,
+            block_ids_by_group=[[10, 11, 12, 13], [20, 21]],
+            block_hashes=[b"\x0a", b"\x0b", b"\x0c", b"\x0d"],
+            can_save=False,
+            load_spec=LoadSpec(0, 64, True, 64),
+        )
+
+        worker._prepare_mooncake_layerwise_sessions([request])
+
+        worker.token_database.load_mask.assert_called_once_with(
+            request.block_hashes,
+            64,
+        )
+        worker.m_store.batch_get_start.assert_not_called()
+
+    def test_multi_group_put_start_uses_group_keys_sizes_and_aligned_results(self):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import (
+            MooncakeLayerwiseGroupPlan,
+        )
+
+        worker = self._make_worker()
+        worker.num_kv_cache_groups = 2
+        worker.grouped_block_size = [16, 32]
+        worker.kv_cache_group_families = ["default", "default"]
+        worker.hash_block_size = 16
+        worker.mooncake_layerwise_group_plans = (
+            MooncakeLayerwiseGroupPlan(
+                group_id=0,
+                effective_block_size=16,
+                object_size=96,
+                num_group_layers=2,
+                physical_to_local_layers=((0, 0), (1, 1)),
+                final_local_layer=1,
+            ),
+            MooncakeLayerwiseGroupPlan(
+                group_id=1,
+                effective_block_size=32,
+                object_size=224,
+                num_group_layers=1,
+                physical_to_local_layers=((0, 0),),
+                final_local_layer=0,
+            ),
+        )
+        worker.m_store.batch_put_start.side_effect = ([0, -1], [0])
+        request = ReqMeta(
+            req_id="r1",
+            token_len_chunk=32,
+            save_end_token=32,
+            target_token_len=32,
+            block_ids_by_group=[[10, 11], [20]],
+            block_hashes=[b"\x0a", b"\x0b"],
+            can_save=True,
+        )
+
+        worker._prepare_mooncake_layerwise_sessions([request])
+
+        self.assertEqual(worker.m_store.batch_put_start.call_count, 2)
+        group_zero_call, group_one_call = worker.m_store.batch_put_start.call_args_list
+        self.assertEqual(group_zero_call.args[1], [96, 96])
+        self.assertEqual(group_one_call.args[1], [224])
+        self.assertTrue(all(key.startswith("model@0@") for key in group_zero_call.args[0]))
+        self.assertTrue(all(key.startswith("model@1@") for key in group_one_call.args[0]))
+        self.assertEqual(
+            request.save_keys_by_group[0].block_keys,
+            [group_zero_call.args[0][0], None],
+        )
+        self.assertEqual(
+            request.save_keys_by_group[1].block_keys,
+            [group_one_call.args[0][0]],
+        )
+
+    def test_multi_group_get_start_flattens_sessions_and_keeps_group_tail(self):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import (
+            MooncakeLayerwiseGroupPlan,
+        )
+
+        worker = self._make_worker()
+        worker.num_kv_cache_groups = 2
+        worker.grouped_block_size = [16, 32]
+        worker.kv_cache_group_families = ["default", "default"]
+        worker.hash_block_size = 16
+        worker.mooncake_layerwise_group_plans = (
+            MooncakeLayerwiseGroupPlan(
+                0,
+                16,
+                96,
+                2,
+                ((0, 0), (1, 1)),
+                1,
+            ),
+            MooncakeLayerwiseGroupPlan(
+                1,
+                32,
+                224,
+                1,
+                ((0, 0),),
+                0,
+            ),
+        )
+        worker.m_store.batch_get_start.return_value = [0, 0, 0, 0, 0]
+        request = ReqMeta(
+            req_id="r1",
+            token_len_chunk=48,
+            target_token_len=48,
+            block_ids_by_group=[[10, 11, 12], [20, 21]],
+            block_hashes=[b"\x0a", b"\x0b", b"\x0c"],
+            can_save=False,
+            load_spec=LoadSpec(0, 48, True, 48),
+        )
+
+        worker._prepare_mooncake_layerwise_sessions([request])
+
+        opened_keys = worker.m_store.batch_get_start.call_args.args[0]
+        self.assertEqual(len(opened_keys), 5)
+        self.assertTrue(all(key.startswith("model@0@") for key in opened_keys[:3]))
+        self.assertTrue(opened_keys[3].startswith("model@1@"))
+        self.assertEqual(opened_keys[4], "model@1@r1_lastblock@0")
+        self.assertEqual(
+            request.load_keys_by_group[0].block_keys,
+            opened_keys[:3],
+        )
+        self.assertEqual(
+            request.load_keys_by_group[1].block_keys,
+            [opened_keys[3]],
+        )
+        self.assertEqual(
+            request.load_keys_by_group[1].last_block_key,
+            "model@1@r1_lastblock@0",
+        )
+        self.assertEqual(request.load_keys_by_group[1].last_block_index, 1)
+        self.assertEqual(request.load_keys, opened_keys)
 
     def test_prepare_sessions_opens_all_gets_before_any_puts(self):
         worker = self._make_worker()
@@ -2963,6 +3327,44 @@ class TestKVPoolWorkerMooncakeLayerSessions(unittest.TestCase):
         self.assertEqual(request.save_block_keys, [])
         self.assertEqual(request.load_block_keys, ["model@0a@0"])
 
+    def test_align_state_group_uses_per_rank_key_and_save_owner(self):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import (
+            MooncakeLayerwiseGroupPlan,
+        )
+
+        worker = self._make_worker()
+        worker.num_kv_cache_groups = 2
+        worker.group_uses_align_state = [False, True]
+        worker.tp_rank = 1
+        worker.put_step = 4
+        worker.mooncake_layerwise_group_plans = (
+            MooncakeLayerwiseGroupPlan(0, 16, 64, 1, ((0, 0),), 0),
+            MooncakeLayerwiseGroupPlan(1, 16, 96, 1, ((0, 0),), 0),
+        )
+        worker.m_store.batch_put_start.return_value = [0]
+        request = ReqMeta(
+            req_id="r1",
+            token_len_chunk=16,
+            save_end_token=16,
+            block_ids_by_group=[[10], [20]],
+            block_hashes=[b"\x0a"],
+            can_save=True,
+        )
+
+        worker.num_layers = 1
+        worker.physical_layer_to_group_layers = {0: [(0, 0), (1, 0)]}
+        worker.process_layer_data([request])
+
+        worker.m_store.batch_put_start.assert_called_once_with(
+            ["model@1@0a@1"],
+            [96],
+        )
+        self.assertEqual(
+            request.save_keys_by_group[1].block_keys,
+            ["model@1@0a@1"],
+        )
+        self.assertEqual(len(worker.layer_save_tasks[0]), 1)
+
     def test_consumer_to_put_remains_a_layerwise_save_owner(self):
         worker = self._make_worker()
         worker.kv_role = "kv_consumer"
@@ -2982,7 +3384,7 @@ class TestKVPoolWorkerMooncakeLayerSessions(unittest.TestCase):
         worker.m_store.batch_put_start.assert_called_once_with(["model@0a@0"], [128])
         self.assertEqual(request.save_block_keys, ["model@0a@0"])
 
-    def test_partial_only_put_start_failures_keep_key_major_tasks(self):
+    def test_partial_only_put_start_failures_do_not_create_range_tasks(self):
         for failure in ("negative", "malformed", "exception"):
             with self.subTest(failure=failure):
                 worker = self._make_worker()
@@ -3006,7 +3408,11 @@ class TestKVPoolWorkerMooncakeLayerSessions(unittest.TestCase):
 
                 self.assertIsNone(request.save_last_block_key)
                 expected_pending = set() if failure == "negative" else {"model@r1_lastblock@0"}
-                self.assertEqual(worker._put_started_keys, expected_pending)
+                self.assertEqual(worker._put_started_keys, set())
+                self.assertEqual(
+                    worker._put_pending_revoke_keys,
+                    expected_pending,
+                )
                 if failure == "negative":
                     worker.kv_send_thread.add_revoke_request.assert_not_called()
                 else:
@@ -3014,8 +3420,7 @@ class TestKVPoolWorkerMooncakeLayerSessions(unittest.TestCase):
                 worker.m_store.batch_revoke.assert_not_called()
                 self.assertEqual(len(worker.layer_save_tasks), 2)
                 for layer_tasks in worker.layer_save_tasks:
-                    self.assertEqual(len(layer_tasks), 1)
-                    self.assertTrue(layer_tasks[0].use_key_major_ranges)
+                    self.assertEqual(layer_tasks, [])
 
     def test_two_layer_role_matrix_advances_once_and_closes_get_session(self):
         role_matrix = (
@@ -3347,9 +3752,10 @@ class TestKVPoolWorkerMooncakeLayerSessions(unittest.TestCase):
 
         self.assertEqual(
             request.load_block_keys,
-            ["model@0a@0", "model@r1_lastblock@0"],
+            ["model@0a@0"],
         )
-        self.assertIsNone(request.load_last_block_key)
+        self.assertEqual(request.load_last_block_key, "model@r1_lastblock@0")
+        self.assertEqual(request.load_keys_by_group[0].last_block_index, 1)
         self.assertEqual(request.load_keys, ["model@0a@0", "model@r1_lastblock@0"])
 
     def test_put_start_shape_error_queues_revoke_and_tracks_pending_keys(self):
@@ -3367,9 +3773,39 @@ class TestKVPoolWorkerMooncakeLayerSessions(unittest.TestCase):
         worker._prepare_mooncake_layerwise_sessions([request])
 
         self.assertEqual(request.save_block_keys, [None, None])
-        self.assertEqual(worker._put_started_keys, {"model@0a@0", "model@0b@0"})
+        self.assertEqual(worker._put_started_keys, set())
+        self.assertEqual(
+            worker._put_pending_revoke_keys,
+            {"model@0a@0", "model@0b@0"},
+        )
         worker.kv_send_thread.add_revoke_request.assert_called_once_with(["model@0a@0", "model@0b@0"])
         worker.m_store.batch_revoke.assert_not_called()
+
+    def test_uncertain_put_start_key_is_not_shared_as_confirmed(self):
+        worker = self._make_worker()
+        worker.m_store.batch_put_start.return_value = []
+        first = ReqMeta(
+            req_id="r1",
+            token_len_chunk=16,
+            block_ids=[10],
+            block_hashes=[b"\x0a"],
+            can_save=True,
+        )
+        second = ReqMeta(
+            req_id="r2",
+            token_len_chunk=16,
+            block_ids=[11],
+            block_hashes=[b"\x0a"],
+            can_save=True,
+        )
+
+        worker._prepare_mooncake_layerwise_sessions([first, second])
+
+        worker.m_store.batch_put_start.assert_called_once()
+        self.assertEqual(first.save_block_keys, [None])
+        self.assertEqual(second.save_block_keys, [None])
+        self.assertEqual(worker._put_started_keys, set())
+        self.assertEqual(worker._put_pending_revoke_keys, {"model@0a@0"})
 
     def test_get_start_shape_error_ends_all_keys_and_marks_all_blocks_invalid(self):
         worker = self._make_worker()

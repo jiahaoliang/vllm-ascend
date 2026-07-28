@@ -41,6 +41,21 @@ def test_new_complete_key_replaces_partial_key_for_same_block():
     assert tracker.prepare_load_entries("r1", []) == [("complete", 1)]
 
 
+def test_group_entries_replace_only_the_same_group_block_location():
+    tracker = MooncakeSessionTracker()
+    tracker.prepare_group_load_entries(
+        "r1",
+        [("g0-old", 0, 7), ("g1-key", 1, 7)],
+    )
+
+    entries = tracker.prepare_group_load_entries(
+        "r1",
+        [("g0-new", 0, 7)],
+    )
+
+    assert entries == [("g1-key", 1, 7), ("g0-new", 0, 7)]
+
+
 def test_shared_key_ends_only_after_last_request_owner_releases_it():
     tracker = MooncakeSessionTracker()
     tracker.prepare_load_entries("r1", [("shared", 0)])
