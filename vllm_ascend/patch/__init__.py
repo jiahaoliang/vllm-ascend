@@ -184,6 +184,23 @@
 #       Remove this patch once upstream vLLM supports hybrid KV cache + CP for
 #       non-CUDA backends, or exposes a platform hook for this behavior.
 #
+# ** 10c. File: platform/patch_group_block_failures.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.v1.core.sched.scheduler.Scheduler._handle_invalid_blocks`
+#    Why:
+#       Upstream failure metadata identifies blocks with a single integer and
+#       cannot distinguish the same block ID in different KV-cache groups.
+#    How:
+#       Decode vLLM-Ascend's private negative group/block IDs and match them
+#       against each request's exact group block table. Nonnegative IDs retain
+#       the upstream behavior; encoded IDs neither truncate tokens nor evict
+#       blocks before the existing failure-policy path finishes the requests.
+#    Related PR (if no, explain why):
+#       No. This supports vLLM-Ascend's multi-group AscendStore metadata.
+#    Future Plan:
+#       Remove this patch when upstream failure metadata carries KV-cache group
+#       identity and supports hybrid group tables.
+#
 # ** 10ab. File: worker/patch_v2/patch_attn_utils.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.v1.worker.gpu.attn_utils.get_kv_cache_spec`

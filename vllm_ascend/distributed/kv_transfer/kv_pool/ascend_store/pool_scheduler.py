@@ -14,7 +14,6 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
     KVCacheConfig,
     MambaSpec,
     SlidingWindowSpec,
@@ -35,17 +34,24 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
     PoolKey,
     ReqMeta,
     RequestTracker,
+    _block_hash_to_bytes,
     block_hash_to_str,
     get_block_hashes,
     get_cache_family_granularity,
     infer_cache_family_ratio,
     infer_group_cache_families,
+    infer_group_uses_align_state,
     infer_tp_mismatch_info,
     is_block_key_layerwise,
     is_kv_save_role,
     make_layerwise_block_key,
     normalize_block_ids_by_group,
     validate_block_key_layerwise_topology,
+)
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator import (
+    AscendStoreCoordinator,
+    ExternalCachedBlockPool,
+    build_ascend_store_coordinator,
 )
 
 
@@ -77,6 +83,9 @@ class KVPoolScheduler:
             else [0]
         )
         self.kv_cache_group_families = self._infer_group_families()
+        self.group_uses_align_state = infer_group_uses_align_state(
+            kv_cache_config.kv_cache_groups if kv_cache_config is not None else None
+        )
         self.need_truncate = self.use_compress
         self.num_swa_blocks = self._infer_swa_blocks()
         if kv_cache_config is not None:
@@ -122,6 +131,7 @@ class KVPoolScheduler:
         self._block_size = self.grouped_block_size[0]
         self.lcm_block_size = math.lcm(*self.grouped_block_size)
         self.cache_transfer_granularity = self._infer_cache_transfer_granularity()
+        self.cache_coordinator = self._build_cache_coordinator(vllm_config)
         # request_id -> full_token_ids
         self._request_trackers: dict[str, RequestTracker] = {}
         self._preempted_req_ids: set[str] = set()
@@ -395,66 +405,96 @@ class KVPoolScheduler:
         token_len: int,
         num_computed_tokens: int,
     ) -> int:
-        num_blocks = token_len // self._block_size
-        block_hashes_to_check = request.block_hashes[:num_blocks]
-        # Validate the remote contiguous prefix from block 0. Actual transfers
-        # still start after vllm_cached_tokens, so locally cached blocks are not
-        # loaded again.
-        query_start_block = 0
-        block_hashes_to_query = block_hashes_to_check[query_start_block:]
-        if not block_hashes_to_query:
+        num_hash_blocks = token_len // self.hash_block_size
+        block_hashes_to_check = request.block_hashes[:num_hash_blocks]
+        if not block_hashes_to_check:
             return 0
-        # Keys use head_or_tp_rank (= tp_rank // put_step).  Ranks in
-        # the same put_step group share one key (same KV cache for MLA latent).
-        # Only tp_size // put_step keys per block, not tp_size.
-        head_or_tp_ranks = self.tp_size // self.put_step
-        keys_by_block = [
-            [
-                make_layerwise_block_key(self.model_name, block_hash.hex(), head_or_tp_rank)
-                for head_or_tp_rank in range(head_or_tp_ranks)
+        multi_group = len(self.grouped_block_size) > 1
+        complete_group_blocks: set[tuple[int, bytes]] = set()
+        single_group_hit_blocks = 0
+        for group_id in range(len(self.grouped_block_size)):
+            head_or_tp_ranks = (
+                self.tp_size
+                if group_id < len(self.group_uses_align_state) and self.group_uses_align_state[group_id]
+                else self.tp_size // self.put_step
+            )
+            effective_block_size = self._get_effective_group_block_size(group_id)
+            group_block_hashes = get_block_hashes(
+                block_hashes_to_check,
+                effective_block_size,
+                self.hash_block_size,
+            )
+            keys_by_block = [
+                [
+                    make_layerwise_block_key(
+                        self.model_name,
+                        block_hash_to_str(block_hash),
+                        head_or_tp_rank,
+                        group_id=group_id if multi_group else None,
+                    )
+                    for head_or_tp_rank in range(head_or_tp_ranks)
+                ]
+                for block_hash in group_block_hashes
             ]
-            for block_hash in block_hashes_to_query
-        ]
-        all_keys = [key for block_keys in keys_by_block for key in block_keys]
-        logger.debug(
-            "[KVPOOL] hit_check req=%s query_blocks=%d head_or_tp_ranks=%d total_keys=%d",
-            request.request_id,
-            len(keys_by_block),
-            head_or_tp_ranks,
-            len(all_keys),
-        )
-        batch_results = self.store_scheduler.batch_is_exist(all_keys)
-
-        if len(batch_results) != len(all_keys):
-            raise RuntimeError(
-                "KV pool batch_is_exist returned unexpected number of results for "
-                f"request {request.request_id}: expected={len(all_keys)}, "
-                f"actual={len(batch_results)}"
-            )
-        if any(result not in (0, 1) for result in batch_results):
-            raise RuntimeError(
-                f"KV pool batch_is_exist failed for request {request.request_id}: states={batch_results}"
-            )
-        num_queried_hit_blocks = 0
-        offset = 0
-        for block_keys in keys_by_block:
-            block_results = batch_results[offset : offset + len(block_keys)]
-            offset += len(block_keys)
-            # Every saving rank must expose a COMPLETE Mooncake object.
-            if all(result == 1 for result in block_results):
-                num_queried_hit_blocks += 1
+            all_keys = [key for block_keys in keys_by_block for key in block_keys]
+            if not all_keys:
                 continue
-            break
-        num_hit_blocks = query_start_block + num_queried_hit_blocks
-        hit_sample = batch_results[: min(8, len(batch_results))]
+            logger.debug(
+                "[KVPOOL] hit_check req=%s group=%d query_blocks=%d head_or_tp_ranks=%d total_keys=%d",
+                request.request_id,
+                group_id,
+                len(keys_by_block),
+                head_or_tp_ranks,
+                len(all_keys),
+            )
+            batch_results = self.store_scheduler.batch_is_exist(all_keys)
+            if type(batch_results) is not list:
+                raise RuntimeError(
+                    "KV pool batch_is_exist returned unexpected result type for "
+                    f"request {request.request_id} group {group_id}: "
+                    f"expected=list, actual={type(batch_results).__name__}"
+                )
+            if len(batch_results) != len(all_keys):
+                raise RuntimeError(
+                    "KV pool batch_is_exist returned unexpected number of results for "
+                    f"request {request.request_id} group {group_id}: "
+                    f"expected={len(all_keys)}, actual={len(batch_results)}"
+                )
+            if any(type(result) is not int or result not in (0, 1) for result in batch_results):
+                raise RuntimeError(
+                    f"KV pool batch_is_exist failed for request {request.request_id} "
+                    f"group {group_id}: states={batch_results}"
+                )
+            offset = 0
+            for group_block_hash, block_keys in zip(group_block_hashes, keys_by_block, strict=True):
+                block_results = batch_results[offset : offset + len(block_keys)]
+                offset += len(block_keys)
+                if all(result == 1 for result in block_results):
+                    complete_group_blocks.add((group_id, _block_hash_to_bytes(group_block_hash)))
+                    if not multi_group:
+                        single_group_hit_blocks += 1
+                    continue
+                if not multi_group:
+                    break
+
+        if not multi_group:
+            hit_tokens = single_group_hit_blocks * self._get_effective_group_block_size(0)
+        else:
+            if self.cache_coordinator is None:
+                raise RuntimeError("Mooncake multi-group layerwise lookup requires a cache coordinator")
+            _, hit_tokens = self.cache_coordinator.find_longest_cache_hit(
+                block_hashes_to_check,
+                token_len,
+                ExternalCachedBlockPool(complete_group_blocks),
+                apply_eagle=False,
+            )
         logger.info(
-            "[KVPOOL] block_key_hit_check req=%s hit_blocks=%d/%d states_sample=%s",
+            "[KVPOOL] block_key_hit_check req=%s complete_group_blocks=%d hit_tokens=%d",
             request.request_id,
-            num_queried_hit_blocks,
-            len(keys_by_block),
-            hit_sample,
+            len(complete_group_blocks),
+            hit_tokens,
         )
-        return num_hit_blocks * self._block_size
+        return hit_tokens
 
     def _get_block_key_layerwise_hit_tokens(
         self,
@@ -471,6 +511,17 @@ class KVPoolScheduler:
     def _infer_group_families(self) -> list[str]:
         kv_cache_groups = self.kv_cache_config.kv_cache_groups if self.kv_cache_config is not None else None
         return infer_group_cache_families(kv_cache_groups, self.compress_ratios, self.hf_config)
+
+    def _build_cache_coordinator(self, vllm_config: VllmConfig) -> AscendStoreCoordinator | None:
+        return build_ascend_store_coordinator(
+            vllm_config,
+            self.kv_cache_config,
+            use_hybrid=self.use_hybrid,
+            scheduler_block_size=self.cache_transfer_granularity,
+            hash_block_size=self.hash_block_size,
+            group_block_sizes=self.grouped_block_size,
+            group_cache_families=self.kv_cache_group_families,
+        )
 
     def _infer_group_block_sizes(
         self,
@@ -522,9 +573,7 @@ class KVPoolScheduler:
             return False
         if getattr(vllm_config.scheduler_config, "disable_hybrid_kv_cache_manager", False):
             return False
-        return len(kv_cache_config.kv_cache_groups) > 1 and any(
-            not isinstance(group.kv_cache_spec, FullAttentionSpec) for group in kv_cache_config.kv_cache_groups
-        )
+        return len(kv_cache_config.kv_cache_groups) > 1
 
     def _infer_mamba_groups(self):
         if self.kv_cache_config is None or not self.use_hybrid:

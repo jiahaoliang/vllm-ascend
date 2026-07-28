@@ -24,9 +24,11 @@ import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
     AscendConnectorMetadata,
     ChunkedTokenDatabase,
+    GroupBlockKeys,
     KeyMetadata,
     LayerMultiBlockReqMeta,
     LayerPoolKey,
+    LayerRangeReqMeta,
     LayerTransferTask,
     LoadSpec,
     PoolKey,
@@ -34,19 +36,28 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
     RequestTracker,
     SharedBlockData,
     get_block_hashes,
+    make_layerwise_block_key,
 )
 
 
 def test_make_layerwise_block_key_uses_model_block_and_rank():
-    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import (
-        config_data,
+    assert make_layerwise_block_key("model", "abc", 0) == "model@abc@0"
+    assert (
+        make_layerwise_block_key("model", "req_lastblock", 3)
+        == "model@req_lastblock@3"
     )
 
-    assert hasattr(config_data, "make_layerwise_block_key")
-    assert config_data.make_layerwise_block_key("model", "abc", 0) == "model@abc@0"
+
+def test_make_layerwise_block_key_includes_group_for_multi_group_objects():
     assert (
-        config_data.make_layerwise_block_key("model", "req_lastblock", 3)
-        == "model@req_lastblock@3"
+        make_layerwise_block_key("model", "abc", 3, group_id=2)
+        == "model@2@abc@3"
+    )
+    assert (
+        make_layerwise_block_key(
+            "model", "req_lastblock", 1, group_id=5
+        )
+        == "model@5@req_lastblock@1"
     )
 
 
@@ -479,6 +490,84 @@ class TestRequestTracker(unittest.TestCase):
 
 
 class TestReqMeta(unittest.TestCase):
+    def test_group_block_keys_keep_group_zero_compatibility_properties(self):
+        group_one_save = GroupBlockKeys(
+            block_keys=["g1-save"],
+            block_offset=4,
+            last_block_key="g1-save-tail",
+            last_block_index=7,
+        )
+        group_one_load = GroupBlockKeys(
+            block_keys=["g1-load"],
+            block_offset=5,
+            last_block_key="g1-load-tail",
+            last_block_index=8,
+        )
+        meta = ReqMeta(
+            req_id="r1",
+            block_ids_by_group=[[10], [20]],
+            save_block_keys=["g0-save"],
+            save_key_block_offset=2,
+            save_last_block_key="g0-save-tail",
+            load_block_keys=["g0-load"],
+            load_key_block_offset=3,
+            load_last_block_key="g0-load-tail",
+            save_keys_by_group={1: group_one_save},
+            load_keys_by_group={1: group_one_load},
+        )
+
+        self.assertEqual(meta.save_block_keys, ["g0-save"])
+        self.assertEqual(meta.save_key_block_offset, 2)
+        self.assertEqual(meta.save_last_block_key, "g0-save-tail")
+        self.assertEqual(meta.load_block_keys, ["g0-load"])
+        self.assertEqual(meta.load_key_block_offset, 3)
+        self.assertEqual(meta.load_last_block_key, "g0-load-tail")
+        self.assertEqual(meta.save_keys_by_group[1], group_one_save)
+        self.assertIsNot(meta.save_keys_by_group[1], group_one_save)
+        self.assertEqual(meta.load_keys_by_group[1], group_one_load)
+        self.assertIsNot(meta.load_keys_by_group[1], group_one_load)
+
+        meta.save_block_keys = ["g0-replaced"]
+        meta.load_key_block_offset = 9
+
+        self.assertEqual(
+            meta.save_keys_by_group[0].block_keys,
+            ["g0-replaced"],
+        )
+        self.assertEqual(meta.load_keys_by_group[0].block_offset, 9)
+        self.assertEqual(meta.save_keys_by_group[1].block_keys, ["g1-save"])
+
+    def test_layer_range_metadata_identifies_owning_group(self):
+        meta = LayerRangeReqMeta(
+            req_ids=["r1"],
+            layer_id=2,
+            group_id=3,
+            block_ids=[7],
+            keys=["key"],
+            all_buffers=[[100]],
+            all_sizes=[[16]],
+            all_offsets=[[32]],
+        )
+
+        self.assertEqual(meta.group_id, 3)
+
+    def test_layer_range_metadata_keeps_load_keys_positional_argument(self):
+        load_keys = ["lease-key"]
+
+        meta = LayerRangeReqMeta(
+            ["r1"],
+            2,
+            [7],
+            ["key"],
+            [[100]],
+            [[16]],
+            [[32]],
+            load_keys,
+        )
+
+        self.assertIs(meta.load_keys, load_keys)
+        self.assertEqual(meta.group_id, 0)
+
     def test_layer_transfer_task_keeps_explicit_batch_kind(self):
         task = LayerTransferTask(
             layer_id=0,

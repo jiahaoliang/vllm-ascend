@@ -4,12 +4,15 @@ from dataclasses import replace
 from importlib import import_module
 from typing import Any, cast
 
+import vllm.envs as envs
+from vllm.config import VllmConfig
 from vllm.logger import logger
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import BlockHash, BlockHashList, KVCacheBlock
 from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
     UniformTypeKVCacheSpecs,
@@ -289,6 +292,39 @@ class AscendStoreCoordinator:
             tuple(blocks if blocks is not None else [] for blocks in hit_blocks_by_group),
             hit_length,
         )
+
+
+def build_ascend_store_coordinator(
+    vllm_config: VllmConfig,
+    kv_cache_config: KVCacheConfig | None,
+    *,
+    use_hybrid: bool,
+    scheduler_block_size: int,
+    hash_block_size: int,
+    group_block_sizes: list[int],
+    group_cache_families: list[str],
+) -> AscendStoreCoordinator | None:
+    if kv_cache_config is None or not use_hybrid:
+        return None
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    use_eagle_fn = getattr(speculative_config, "use_eagle", None)
+    use_eagle = bool(use_eagle_fn()) if callable(use_eagle_fn) else False
+    retention_interval = getattr(
+        envs,
+        "VLLM_PREFIX_CACHE_RETENTION_INTERVAL",
+        None,
+    )
+    if not isinstance(retention_interval, int):
+        retention_interval = None
+    return AscendStoreCoordinator(
+        kv_cache_config.kv_cache_groups,
+        scheduler_block_size=scheduler_block_size,
+        hash_block_size=hash_block_size,
+        group_block_sizes=group_block_sizes,
+        group_cache_families=group_cache_families,
+        use_eagle=use_eagle,
+        retention_interval=retention_interval,
+    )
 
 
 def _unwrap_spec(spec: KVCacheSpec) -> KVCacheSpec:

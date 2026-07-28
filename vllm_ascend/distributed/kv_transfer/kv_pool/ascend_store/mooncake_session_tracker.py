@@ -26,35 +26,52 @@ class MooncakeSessionTracker:
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
-        self._request_load_entries: dict[str, dict[str, int]] = {}
-        self._pending_put_owners: dict[str, dict[str, int]] = {}
+        self._request_load_entries: dict[str, dict[str, tuple[int, int]]] = {}
+        self._pending_put_owners: dict[str, dict[str, tuple[int, int]]] = {}
         self._load_key_owners: dict[str, set[str]] = {}
 
     @staticmethod
-    def _replace_block_entry(entries: dict[str, int], key: str, block_index: int) -> None:
-        for previous_key, previous_index in list(entries.items()):
-            if previous_index == block_index and previous_key != key:
+    def _replace_block_entry(
+        entries: dict[str, tuple[int, int]],
+        key: str,
+        group_id: int,
+        block_index: int,
+    ) -> None:
+        for previous_key, previous_location in list(entries.items()):
+            if previous_location == (group_id, block_index) and previous_key != key:
                 del entries[previous_key]
-        entries[key] = block_index
+        entries[key] = (group_id, block_index)
+
+    @staticmethod
+    def _normalize_entry(entry: tuple[str, int] | tuple[str, int, int]) -> tuple[str, int, int]:
+        if len(entry) == 2:
+            key, block_index = entry
+            return key, 0, block_index
+        key, group_id, block_index = entry
+        return key, group_id, block_index
 
     def register_put_keys(
         self,
         req_id: str,
-        entries: Iterable[tuple[str, int]],
+        entries: Iterable[tuple[str, int] | tuple[str, int, int]],
     ) -> None:
         """Remember which requests should consume a key after PutEnd succeeds."""
         with self._lock:
-            for key, block_index in entries:
-                self._pending_put_owners.setdefault(key, {})[req_id] = block_index
+            for entry in entries:
+                key, group_id, block_index = self._normalize_entry(entry)
+                self._pending_put_owners.setdefault(key, {})[req_id] = (
+                    group_id,
+                    block_index,
+                )
 
     def commit_put_keys(self, keys: Iterable[str]) -> None:
         """Promote successfully committed keys into each owner's future loads."""
         with self._lock:
             for key in keys:
                 request_entries = self._pending_put_owners.pop(key, {})
-                for req_id, block_index in request_entries.items():
+                for req_id, (group_id, block_index) in request_entries.items():
                     entries = self._request_load_entries.setdefault(req_id, {})
-                    self._replace_block_entry(entries, key, block_index)
+                    self._replace_block_entry(entries, key, group_id, block_index)
 
     def revoke_put_keys(self, keys: Iterable[str]) -> None:
         with self._lock:
@@ -66,12 +83,24 @@ class MooncakeSessionTracker:
         req_id: str,
         current_entries: Iterable[tuple[str, int]],
     ) -> list[tuple[str, int]]:
+        """Group-0 compatibility adapter for single-group callers."""
+        entries = self.prepare_group_load_entries(req_id, current_entries)
+        if any(group_id != 0 for _, group_id, _ in entries):
+            raise ValueError("multi-group callers must use prepare_group_load_entries")
+        return [(key, block_index) for key, _, block_index in entries]
+
+    def prepare_group_load_entries(
+        self,
+        req_id: str,
+        current_entries: Iterable[tuple[str, int] | tuple[str, int, int]],
+    ) -> list[tuple[str, int, int]]:
         """Merge current hits with keys completed by earlier chunks."""
         with self._lock:
             entries = self._request_load_entries.setdefault(req_id, {})
-            for key, block_index in current_entries:
-                self._replace_block_entry(entries, key, block_index)
-            return list(entries.items())
+            for entry in current_entries:
+                key, group_id, block_index = self._normalize_entry(entry)
+                self._replace_block_entry(entries, key, group_id, block_index)
+            return [(key, group_id, block_index) for key, (group_id, block_index) in entries.items()]
 
     def record_get_result(
         self,

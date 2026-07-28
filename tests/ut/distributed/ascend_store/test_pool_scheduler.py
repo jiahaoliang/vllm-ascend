@@ -16,12 +16,24 @@
 #
 
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
+# isort: off
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import LoadSpec
+import torch  # noqa: E402
+from vllm.v1.kv_cache_interface import (  # noqa: E402
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    SlidingWindowSpec,
+)
+
+# isort: on
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
+    LoadSpec,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler import (
     KVPoolScheduler,
     LookupKeyClient,
@@ -92,6 +104,38 @@ class TestKVPoolScheduler(unittest.TestCase):
         config.model_config.get_num_layers.return_value = 2
         return config
 
+    def _make_hybrid_config(self, group_block_sizes=(16, 32)):
+        config = self._make_config(extra_config={"backend": "mooncake"})
+        config.scheduler_config.disable_hybrid_kv_cache_manager = False
+        config.speculative_config = None
+        full_block_size, swa_block_size = group_block_sizes
+        kv_cache_config = KVCacheConfig(
+            num_blocks=8,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    ["layer.0"],
+                    FullAttentionSpec(
+                        block_size=full_block_size,
+                        num_kv_heads=1,
+                        head_size=1,
+                        dtype=torch.float32,
+                    ),
+                ),
+                KVCacheGroupSpec(
+                    ["layer.1"],
+                    SlidingWindowSpec(
+                        block_size=swa_block_size,
+                        num_kv_heads=1,
+                        head_size=1,
+                        dtype=torch.float32,
+                        sliding_window=2 * swa_block_size + 1,
+                    ),
+                ),
+            ],
+        )
+        return config, kv_cache_config
+
     def test_memcache_block_key_layerwise_rejects_non_tp_topology(self):
         config = self._make_config(extra_config={"backend": "memcache"})
         config.parallel_config.pipeline_parallel_size = 2
@@ -129,9 +173,7 @@ class TestKVPoolScheduler(unittest.TestCase):
         scheduler.store_scheduler.batch_is_exist.return_value = [1, 1]
 
         self.assertEqual(scheduler._get_block_key_layerwise_hit_tokens(request, 32, 0), 32)
-        scheduler.store_scheduler.batch_is_exist.assert_called_once_with(
-            ["llama-7b@aa@0", "llama-7b@bb@0"]
-        )
+        scheduler.store_scheduler.batch_is_exist.assert_called_once_with(["llama-7b@aa@0", "llama-7b@bb@0"])
 
     def test_mooncake_block_key_hit_stops_at_miss(self):
         config = self._make_config(extra_config={"backend": "mooncake"})
@@ -170,6 +212,112 @@ class TestKVPoolScheduler(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "unexpected number of results"):
             scheduler._get_block_key_layerwise_hit_tokens(request, 16, 0)
+
+    def test_mooncake_block_key_hit_rejects_malformed_result_types(self):
+        config = self._make_config(extra_config={"backend": "mooncake"})
+        scheduler = KVPoolScheduler(config, use_layerwise=True)
+        request = MagicMock()
+        request.request_id = "r1"
+        request.block_hashes = [b"\xaa"]
+
+        for malformed_results in ([True], (1,), True):
+            with self.subTest(malformed_results=malformed_results):
+                scheduler.store_scheduler.batch_is_exist.return_value = malformed_results
+                with self.assertRaisesRegex(RuntimeError, r"request r1"):
+                    scheduler._get_block_key_layerwise_hit_tokens(request, 16, 0)
+
+    def test_mooncake_multi_group_hit_uses_group_hashes_and_common_prefix(self):
+        config, kv_cache_config = self._make_hybrid_config()
+        config.parallel_config.tensor_parallel_size = 2
+        config.parallel_config.world_size = 2
+        config.model_config.get_total_num_kv_heads.return_value = 2
+        scheduler = KVPoolScheduler(config, use_layerwise=True, kv_cache_config=kv_cache_config)
+        request = MagicMock()
+        request.request_id = "r1"
+        request.block_hashes = [b"\xaa", b"\xbb", b"\xcc", b"\xdd"]
+        scheduler.store_scheduler.batch_is_exist.side_effect = [
+            [1] * 8,
+            [1, 1, 1, 0],
+        ]
+
+        self.assertEqual(
+            scheduler._get_block_key_layerwise_hit_tokens(request, 64, 0),
+            32,
+        )
+        self.assertEqual(
+            scheduler.store_scheduler.batch_is_exist.call_args_list,
+            [
+                call(
+                    [
+                        "llama-7b@0@aa@0",
+                        "llama-7b@0@aa@1",
+                        "llama-7b@0@bb@0",
+                        "llama-7b@0@bb@1",
+                        "llama-7b@0@cc@0",
+                        "llama-7b@0@cc@1",
+                        "llama-7b@0@dd@0",
+                        "llama-7b@0@dd@1",
+                    ]
+                ),
+                call(
+                    [
+                        "llama-7b@1@9528fb79e1fd3d54f69aaa6c0236f156fb3331abe7bd57e6d0bbb79238dc67da@0",
+                        "llama-7b@1@9528fb79e1fd3d54f69aaa6c0236f156fb3331abe7bd57e6d0bbb79238dc67da@1",
+                        "llama-7b@1@8a68fe0b0cbcab024a03213bce8adf39a60e9035ea9f6c6f1c7a627a97552749@0",
+                        "llama-7b@1@8a68fe0b0cbcab024a03213bce8adf39a60e9035ea9f6c6f1c7a627a97552749@1",
+                    ]
+                ),
+            ],
+        )
+
+    def test_mooncake_multi_group_hit_queries_every_align_state_rank(self):
+        config, kv_cache_config = self._make_hybrid_config()
+        config.parallel_config.tensor_parallel_size = 4
+        config.parallel_config.world_size = 4
+        config.model_config.use_mla = True
+        scheduler = KVPoolScheduler(
+            config,
+            use_layerwise=True,
+            kv_cache_config=kv_cache_config,
+        )
+        scheduler.group_uses_align_state = [False, True]
+        request = MagicMock()
+        request.request_id = "r1"
+        request.block_hashes = [b"\xaa", b"\xbb"]
+        scheduler.store_scheduler.batch_is_exist.side_effect = [
+            [1, 1],
+            [1, 1, 1, 1],
+        ]
+
+        self.assertEqual(
+            scheduler._get_block_key_layerwise_hit_tokens(request, 32, 0),
+            32,
+        )
+        group_one_keys = scheduler.store_scheduler.batch_is_exist.call_args_list[1].args[0]
+        self.assertEqual(len(group_one_keys), 4)
+        self.assertEqual(
+            [key.rsplit("@", 1)[-1] for key in group_one_keys],
+            ["0", "1", "2", "3"],
+        )
+
+    def test_mooncake_multi_group_hit_allows_missing_unreachable_swa_blocks(self):
+        config, kv_cache_config = self._make_hybrid_config(group_block_sizes=(64, 16))
+        scheduler = KVPoolScheduler(config, use_layerwise=True, kv_cache_config=kv_cache_config)
+        request = MagicMock()
+        request.request_id = "r1"
+        request.block_hashes = [b"\xaa", b"\xbb", b"\xcc", b"\xdd"]
+        # At the 64-token alignment boundary, only the final two 16-token
+        # SWA objects are reachable and therefore stored.
+        scheduler.store_scheduler.batch_is_exist.side_effect = [
+            [1],
+            [0, 0, 1, 1],
+        ]
+
+        self.assertIsNotNone(scheduler.cache_coordinator)
+        self.assertEqual(
+            scheduler._get_block_key_layerwise_hit_tokens(request, 64, 0),
+            64,
+        )
 
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
     def test_get_num_new_matched_tokens_consumer_no_load(self, mock_client_cls):
@@ -702,6 +850,23 @@ class TestKVPoolSchedulerStaticMethods(unittest.TestCase):
         kv_cache_config = MagicMock()
         kv_cache_config.kv_cache_groups = [MagicMock()]
         self.assertFalse(KVPoolScheduler._uses_hybrid_kv_cache(vllm_config, kv_cache_config))
+
+    def test_uses_hybrid_kv_cache_multiple_full_attention_groups(self):
+        vllm_config = MagicMock()
+        vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = False
+        full_attention = MagicMock(spec=FullAttentionSpec)
+        kv_cache_config = MagicMock()
+        kv_cache_config.kv_cache_groups = [
+            MagicMock(kv_cache_spec=full_attention),
+            MagicMock(kv_cache_spec=full_attention),
+        ]
+
+        self.assertTrue(
+            KVPoolScheduler._uses_hybrid_kv_cache(
+                vllm_config,
+                kv_cache_config,
+            )
+        )
 
     def test_get_group_family_out_of_range(self):
         self.assertEqual(KVPoolScheduler._get_group_family(None, ["a"], 5), "default")
