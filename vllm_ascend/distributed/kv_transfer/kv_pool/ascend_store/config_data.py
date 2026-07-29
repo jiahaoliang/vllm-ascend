@@ -63,8 +63,7 @@ def validate_block_key_layerwise_topology(
     unsupported = [f"{label}={size}" for label, size in topology_dimensions if size > 1]
     if unsupported:
         raise ValueError(
-            f"{backend_name} block-key layerwise supports TP-only topology; unsupported "
-            + ", ".join(unsupported)
+            f"{backend_name} block-key layerwise supports TP-only topology; unsupported " + ", ".join(unsupported)
         )
 
 

@@ -129,9 +129,7 @@ class TestKVPoolScheduler(unittest.TestCase):
         scheduler.store_scheduler.batch_is_exist.return_value = [1, 1]
 
         self.assertEqual(scheduler._get_block_key_layerwise_hit_tokens(request, 32, 0), 32)
-        scheduler.store_scheduler.batch_is_exist.assert_called_once_with(
-            ["llama-7b@aa@0", "llama-7b@bb@0"]
-        )
+        scheduler.store_scheduler.batch_is_exist.assert_called_once_with(["llama-7b@aa@0", "llama-7b@bb@0"])
 
     def test_mooncake_block_key_hit_stops_at_miss(self):
         config = self._make_config(extra_config={"backend": "mooncake"})

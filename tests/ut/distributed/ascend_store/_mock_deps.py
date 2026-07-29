@@ -376,15 +376,11 @@ def _make_pkg(name, path=""):
     return mod
 
 
-_vllm_ascend_real_path = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "vllm_ascend")
-)
+_vllm_ascend_real_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "vllm_ascend"))
 for _pkg in ["vllm_ascend", "vllm_ascend.distributed"]:
     if _pkg not in sys.modules:
         _pkg_path = (
-            _vllm_ascend_real_path
-            if _pkg == "vllm_ascend"
-            else os.path.join(_vllm_ascend_real_path, "distributed")
+            _vllm_ascend_real_path if _pkg == "vllm_ascend" else os.path.join(_vllm_ascend_real_path, "distributed")
         )
         sys.modules[_pkg] = _make_pkg(
             _pkg,

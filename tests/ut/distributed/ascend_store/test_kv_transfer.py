@@ -1814,9 +1814,7 @@ class TestKVCacheStoreLayerSendingThread(unittest.TestCase):
                     ):
                         self._run_task(thread, first_layer_tasks)
                 elif failure == "sync":
-                    thread.sync_save_events[0].synchronize.side_effect = RuntimeError(
-                        "sync failed"
-                    )
+                    thread.sync_save_events[0].synchronize.side_effect = RuntimeError("sync failed")
                     self._run_task(thread, first_layer_tasks)
                     thread.sync_save_events[0].synchronize.side_effect = None
                 else:
@@ -2231,13 +2229,9 @@ class TestKVCacheStoreLayerRecvingThread(unittest.TestCase):
                     data = self._make_partial_load_task(thread, include_full_block)
                     thread.request_queue.put(data)
                     if failure == "builder":
-                        thread.layer_batch_builder.build_addrs = MagicMock(
-                            side_effect=RuntimeError("metadata failed")
-                        )
+                        thread.layer_batch_builder.build_addrs = MagicMock(side_effect=RuntimeError("metadata failed"))
                     elif failure == "backend":
-                        store.batch_copy_get = MagicMock(
-                            side_effect=RuntimeError("transfer failed")
-                        )
+                        store.batch_copy_get = MagicMock(side_effect=RuntimeError("transfer failed"))
                     else:
                         store.copy_get_results = [[96] if include_full_block else []]
 

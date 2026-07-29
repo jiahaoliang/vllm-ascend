@@ -104,9 +104,7 @@ class TestAscendStoreConnector(unittest.TestCase):
                 "decode_context_parallel_size",
             ):
                 with self.subTest(backend=backend_name, topology=attribute):
-                    config = self._make_vllm_config(
-                        extra_config={"use_layerwise": True, "backend": backend_name}
-                    )
+                    config = self._make_vllm_config(extra_config={"use_layerwise": True, "backend": backend_name})
                     setattr(config.parallel_config, attribute, 2)
 
                     with self.assertRaisesRegex(ValueError, rf"{backend_name}.*{attribute}=2"):
