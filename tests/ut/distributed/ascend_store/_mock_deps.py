@@ -26,6 +26,7 @@ Usage at the top of each test file:
 import importlib.util
 import logging
 import os
+import re
 import sys
 import types
 from typing import Any
@@ -36,10 +37,12 @@ from unittest.mock import MagicMock
 # ---------------------------------------------------------------------------
 if "torch" not in sys.modules and importlib.util.find_spec("torch") is None:
     _torch = types.ModuleType("torch")
+    _torch.__path__ = []  # type: ignore[attr-defined]
     _torch.Tensor = MagicMock  # type: ignore[attr-defined]
     _torch.bool = "bool"  # type: ignore[attr-defined]
     _torch.float16 = "float16"  # type: ignore[attr-defined]
     _torch.float32 = "float32"  # type: ignore[attr-defined]
+    _torch.ones = MagicMock(return_value=MagicMock())  # type: ignore[attr-defined]
     _torch.zeros = MagicMock(return_value=MagicMock())  # type: ignore[attr-defined]
     _torch.sum = MagicMock(return_value=0)  # type: ignore[attr-defined]
     _torch.device = MagicMock()  # type: ignore[attr-defined]
@@ -49,8 +52,13 @@ if "torch" not in sys.modules and importlib.util.find_spec("torch") is None:
     _npu.current_device = MagicMock(return_value=0)
     _npu.set_device = MagicMock()
     _torch.npu = _npu  # type: ignore[attr-defined]
+    _torch_library = types.ModuleType("torch.library")
+    _torch_library.Library = MagicMock  # type: ignore[attr-defined]
+    _torch_library.infer_schema = MagicMock()  # type: ignore[attr-defined]
+    _torch.library = _torch_library  # type: ignore[attr-defined]
     sys.modules["torch"] = _torch
     sys.modules["torch.distributed"] = _torch.distributed  # type: ignore[attr-defined]
+    sys.modules["torch.library"] = _torch_library
 
 if "torch_npu" not in sys.modules:
     sys.modules["torch_npu"] = MagicMock()
@@ -349,6 +357,9 @@ if _MOCK_VLLM_DEPS:
 # ---------------------------------------------------------------------------
 # Mock external backends
 # ---------------------------------------------------------------------------
+if importlib.util.find_spec("regex") is None:
+    sys.modules["regex"] = re
+
 for _mod_name in [
     "mooncake",
     "mooncake.engine",

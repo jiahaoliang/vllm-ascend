@@ -611,7 +611,7 @@ class KVPoolScheduler:
         ):
             return 0, False
 
-        if self.use_gva_layerwise:
+        if self.use_memcache_gva_layerwise:
             token_len = prompt_token_len
             num_external_hit_tokens = self._get_layerwise_gva_hit_tokens(request, token_len, num_computed_tokens)
         else:
