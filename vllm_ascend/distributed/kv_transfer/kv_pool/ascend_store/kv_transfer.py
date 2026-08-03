@@ -321,6 +321,7 @@ class LayerBatchBuilder:
     ) -> SharedBlockData:
         block_ids: list[int] = []
         block_keys: list[str] = []
+        row_req_ids: list[str] = []
         req_ids: list[str] = []
         is_last_chunks: list[bool | None] = []
         all_load_keys: list[str] = []
@@ -365,6 +366,7 @@ class LayerBatchBuilder:
                 if key is not None and (not is_save or key not in seen_save_keys):
                     block_ids.append(block_id)
                     block_keys.append(key)
+                    row_req_ids.append(request.req_id)
                     if is_save:
                         seen_save_keys.add(key)
 
@@ -377,6 +379,7 @@ class LayerBatchBuilder:
                 if last_block_key is not None and (not is_save or last_block_key not in seen_save_keys):
                     block_ids.append(request_block_ids[partial_block_index])
                     block_keys.append(last_block_key)
+                    row_req_ids.append(request.req_id)
                     if is_save:
                         seen_save_keys.add(last_block_key)
 
@@ -387,6 +390,7 @@ class LayerBatchBuilder:
             req_ids=req_ids,
             is_last_chunks=is_last_chunks,
             load_keys=all_load_keys,
+            row_req_ids=row_req_ids,
         )
 
     def build_shared(self, task: LayerTransferTask, is_save: bool = True) -> SharedBlockData | None:
@@ -484,6 +488,7 @@ class LayerBatchBuilder:
                 all_sizes=[sizes.copy() for _ in shared.block_ids_arr],
                 all_offsets=[offsets.copy() for _ in shared.block_ids_arr],
                 load_keys=shared.load_keys,
+                row_req_ids=shared.row_req_ids,
             )
 
         assert shared.block_gvas_arr is not None
@@ -2059,19 +2064,32 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         active_keys = [req_meta.keys[index] for index in active_indices]
         if active_keys:
             self._stagger_h2d_submit(layer_id)
-            active_buffers = [req_meta.all_buffers[index] for index in active_indices]
             active_sizes = [req_meta.all_sizes[index] for index in active_indices]
             active_offsets = [req_meta.all_offsets[index] for index in active_indices]
-            results = require_aligned_batch_results(
-                "batch_copy_get",
-                active_keys,
-                self.m_store.batch_copy_get(
-                    active_keys,
-                    active_buffers,
-                    active_sizes,
-                    active_offsets,
-                ),
-            )
+            if req_meta.row_req_ids and len(req_meta.row_req_ids) != len(req_meta.keys):
+                raise RuntimeError("Mooncake range row ownership does not align with keys")
+            # Keep Mooncake's key-major batching within one request. Mixing
+            # destinations from concurrent requests can corrupt a target row.
+            indices_by_request: dict[str | None, list[int]] = {}
+            for index in active_indices:
+                req_id = req_meta.row_req_ids[index] if req_meta.row_req_ids else None
+                indices_by_request.setdefault(req_id, []).append(index)
+
+            results_by_index: dict[int, int] = {}
+            for request_indices in indices_by_request.values():
+                request_keys = [req_meta.keys[index] for index in request_indices]
+                request_results = require_aligned_batch_results(
+                    "batch_copy_get",
+                    request_keys,
+                    self.m_store.batch_copy_get(
+                        request_keys,
+                        [req_meta.all_buffers[index] for index in request_indices],
+                        [req_meta.all_sizes[index] for index in request_indices],
+                        [req_meta.all_offsets[index] for index in request_indices],
+                    ),
+                )
+                results_by_index.update(zip(request_indices, request_results, strict=True))
+            results = [results_by_index[index] for index in active_indices]
             _emit_range_debug_event("load", layer_id, active_sizes, active_offsets, results)
             failed_indices = [index for index, result in zip(active_indices, results, strict=True) if result < 0]
             if failed_indices:

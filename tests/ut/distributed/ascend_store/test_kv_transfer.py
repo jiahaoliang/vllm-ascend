@@ -2267,6 +2267,87 @@ class TestKVCacheStoreLayerRecvingThread(unittest.TestCase):
         )
         self.assertEqual(invalid_block_ids, set())
 
+    def test_concurrent_requests_use_separate_ranged_batches(self):
+        thread, store, invalid_block_ids, _, _ = self._make_thread(num_layers=1)
+        first = ReqMeta(
+            req_id="r1",
+            block_ids=[3, 4],
+            load_block_keys=["shared-key", "r1-key"],
+            load_keys=["shared-key", "r1-key"],
+            is_last_chunk=True,
+        )
+        second = ReqMeta(
+            req_id="r2",
+            block_ids=[5, 6],
+            load_block_keys=["shared-key", "r2-key"],
+            load_keys=["shared-key", "r2-key"],
+            is_last_chunk=True,
+        )
+        task = LayerTransferTask(
+            0,
+            [
+                LayerBlockRange(first, 0, 2),
+                LayerBlockRange(second, 0, 2),
+            ],
+            use_key_major_ranges=True,
+        )
+        task.shared_block_data = thread.build_shared_data(task)
+
+        self._run_task(thread, LayerLoadTask(None, [task], 0))
+
+        self.assertEqual(
+            [call[0] for call in store.copy_get_calls],
+            [["shared-key", "r1-key"], ["shared-key", "r2-key"]],
+        )
+        self.assertEqual(invalid_block_ids, set())
+
+    def test_concurrent_request_failure_filters_only_its_row(self):
+        thread, store, invalid_block_ids, _, load_abort_event = self._make_thread()
+        store.copy_get_results = [
+            [96, -1],
+            [96, 96],
+            [96],
+            [96, 96],
+        ]
+        first = ReqMeta(
+            req_id="r1",
+            block_ids=[3, 4],
+            load_block_keys=["shared-key", "r1-key"],
+            load_keys=["shared-key", "r1-key"],
+            is_last_chunk=True,
+        )
+        second = ReqMeta(
+            req_id="r2",
+            block_ids=[5, 6],
+            load_block_keys=["shared-key", "r2-key"],
+            load_keys=["shared-key", "r2-key"],
+            is_last_chunk=True,
+        )
+
+        for layer_id in range(2):
+            task = LayerTransferTask(
+                layer_id,
+                [
+                    LayerBlockRange(first, 0, 2),
+                    LayerBlockRange(second, 0, 2),
+                ],
+                use_key_major_ranges=True,
+            )
+            task.shared_block_data = thread.build_shared_data(task)
+            self._run_task(thread, LayerLoadTask(None, [task], layer_id))
+
+        self.assertEqual(
+            [call[0] for call in store.copy_get_calls],
+            [
+                ["shared-key", "r1-key"],
+                ["shared-key", "r2-key"],
+                ["shared-key"],
+                ["shared-key", "r2-key"],
+            ],
+        )
+        self.assertEqual(invalid_block_ids, {4})
+        self.assertFalse(load_abort_event.is_set())
+
 
 class TestKVTransferTpMismatchDispatch(unittest.TestCase):
     """TP-mismatch worker dispatch wiring for Sending/Recving threads."""
