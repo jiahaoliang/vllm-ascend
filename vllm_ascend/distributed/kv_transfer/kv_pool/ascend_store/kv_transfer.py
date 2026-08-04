@@ -7,6 +7,7 @@ import threading
 import time
 from collections import defaultdict
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -41,8 +42,16 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_transfer import (
     LayerTransferArrayBuilder,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mooncake_session_tracker import (
+    MooncakeSessionTracker,
+)
 
 _H2D_STAGGER_SPIN_US = 50
+
+
+@dataclass(frozen=True)
+class _LayerRevokeTask:
+    keys: tuple[str, ...]
 
 
 def _circular_shift(lst: list, offset: int) -> list:
@@ -1486,6 +1495,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         group_builders: list[LayerBatchBuilder] | None = None,
         put_started_keys: set[str] | None = None,
         put_started_keys_lock: threading.Lock | None = None,
+        session_tracker: MooncakeSessionTracker | None = None,
     ):
         super().__init__(
             m_store,
@@ -1519,6 +1529,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             )
         self._put_started_keys = put_started_keys if put_started_keys is not None else set()
         self._put_started_keys_lock = put_started_keys_lock or threading.Lock()
+        self._session_tracker = session_tracker
         self._active_put_keys: set[str] | None = None
         self.group_builders: list[LayerBatchBuilder] | None = group_builders
         if group_builders is not None:
@@ -1587,6 +1598,11 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
     ) -> torch.Tensor:
         self.request_queue.put(req_meta)
 
+    def add_revoke_request(self, keys: list[str]) -> None:
+        deduplicated_keys = tuple(dict.fromkeys(keys))
+        if deduplicated_keys:
+            self.request_queue.put(_LayerRevokeTask(deduplicated_keys))
+
     def _remove_started_keys(self, keys: list[str]) -> None:
         with self._put_started_keys_lock:
             self._put_started_keys.difference_update(keys)
@@ -1607,6 +1623,8 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             # revoke attempt even when the remote cleanup fails; the Master TTL
             # owns any remaining PROCESSING session.
             self._remove_started_keys(keys)
+            if self._session_tracker is not None:
+                self._session_tracker.revoke_put_keys(keys)
 
     def _handle_range_request(self, req_meta: LayerRangeReqMeta) -> None:
         layer_id = req_meta.layer_id
@@ -1673,6 +1691,15 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                     ]
                     if failed_commit_keys:
                         self._revoke_range_keys(failed_commit_keys)
+                    committed_keys = [
+                        key
+                        for key, result in zip(
+                            active_keys, commit_results, strict=True
+                        )
+                        if result == 0
+                    ]
+                    if self._session_tracker is not None:
+                        self._session_tracker.commit_put_keys(committed_keys)
                     self._remove_started_keys(active_keys)
             self._active_put_keys = None
 
@@ -1755,8 +1782,15 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         self.request_queue.task_done()
 
     def _handle_request(  # type: ignore[override]
-        self, request: LayerSaveTask | LayerwisePreparation
+        self,
+        request: LayerSaveTask | LayerwisePreparation | _LayerRevokeTask,
     ):
+        if isinstance(request, _LayerRevokeTask):
+            try:
+                self._revoke_range_keys(list(request.keys))
+            finally:
+                self.request_queue.task_done()
+            return
         if isinstance(request, LayerwisePreparation):
             try:
                 request.ensure_ready()
