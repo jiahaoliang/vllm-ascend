@@ -27,6 +27,9 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import (
+    range_debug as _range_debug,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend import Backend
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.yuanrong_backend import (
     YuanrongConfig,
@@ -449,7 +452,7 @@ class TestMooncakeBackendMethods(unittest.TestCase):
 
         with (
             patch.dict(os.environ, {"VLLM_ASCEND_KVPOOL_RANGE_DEBUG": "1"}),
-            patch.object(_mooncake_backend.logger, "info") as log_info,
+            patch.object(_range_debug.logger, "info") as log_info,
         ):
             b.put(["k1", "k2"], [[100], [200]], [[10], [20]])
             b.get(["k1", "k2"], [[300], [400]], [[10], [20]])
@@ -470,7 +473,7 @@ class TestMooncakeBackendMethods(unittest.TestCase):
         b.store = _StrictLayerwiseStore()
         with (
             patch.dict(os.environ, {"VLLM_ASCEND_KVPOOL_RANGE_DEBUG": "1"}),
-            patch.object(_mooncake_backend.logger, "info") as ranged_log_info,
+            patch.object(_range_debug.logger, "info") as ranged_log_info,
         ):
             self.assertEqual(b.batch_copy_put(["k"], [[100]], [[64]], [[0]]), [64])
             self.assertEqual(b.batch_copy_get(["k"], [[200]], [[64]], [[0]]), [64])

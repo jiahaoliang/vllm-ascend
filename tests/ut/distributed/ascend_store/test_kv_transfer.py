@@ -30,6 +30,9 @@ from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import (
     kv_transfer as kv_transfer_module,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import (
+    range_debug as range_debug_module,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
     GroupBatchPlan,
     GroupTransferData,
@@ -1725,7 +1728,7 @@ class TestKVCacheStoreLayerSendingThread(unittest.TestCase):
 
         with (
             patch.dict(os.environ, {"VLLM_ASCEND_KVPOOL_RANGE_DEBUG": "1"}),
-            patch.object(kv_transfer_module.logger, "info") as log_info,
+            patch.object(range_debug_module.logger, "info") as log_info,
         ):
             for layer_id in range(2):
                 self._run_task(thread, self._make_task(thread, layer_id))
@@ -1757,8 +1760,8 @@ class TestKVCacheStoreLayerSendingThread(unittest.TestCase):
         with (
             patch.dict(os.environ, {"VLLM_ASCEND_KVPOOL_RANGE_DEBUG": "0"}),
             patch.object(
-                kv_transfer_module,
-                "_build_range_debug_payload",
+                range_debug_module,
+                "_build_range_payload",
                 side_effect=AssertionError("payload builder must not run"),
             ) as build_payload,
         ):
@@ -1775,7 +1778,7 @@ class TestKVCacheStoreLayerSendingThread(unittest.TestCase):
         with (
             patch.dict(os.environ, {"VLLM_ASCEND_KVPOOL_RANGE_DEBUG": "1"}),
             patch.object(
-                kv_transfer_module.json,
+                range_debug_module.json,
                 "dumps",
                 side_effect=RuntimeError("serialize failed"),
             ),
@@ -2122,7 +2125,7 @@ class TestKVCacheStoreLayerRecvingThread(unittest.TestCase):
 
         with (
             patch.dict(os.environ, {"VLLM_ASCEND_KVPOOL_RANGE_DEBUG": "1"}),
-            patch.object(kv_transfer_module.logger, "info") as log_info,
+            patch.object(range_debug_module.logger, "info") as log_info,
         ):
             for layer_id in range(2):
                 self._run_task(thread, self._make_load_task(thread, layer_id))
