@@ -17,6 +17,7 @@
 
 import hashlib
 import unittest
+from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -31,6 +32,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
     LayerMultiBlockReqMeta,
     LayerPoolKey,
     LayerRangeReqMeta,
+    LayerRangeRow,
     LayerTransferTask,
     LoadSpec,
     PoolKey,
@@ -564,6 +566,59 @@ class TestReqMeta(unittest.TestCase):
 
         self.assertIs(meta.load_keys, load_keys)
         self.assertEqual(meta.group_id, 0)
+
+    def test_layer_range_metadata_uses_immutable_rows_as_legacy_view_source(self):
+        row = LayerRangeRow(
+            req_id="r1",
+            block_id=7,
+            key="key",
+            buffers=(100, 200),
+            sizes=(16, 8),
+            offsets=(32, 48),
+        )
+        meta = LayerRangeReqMeta(
+            req_ids=["r1"],
+            layer_id=2,
+            rows=(row,),
+            load_keys=["lease-key"],
+            group_id=3,
+        )
+
+        self.assertEqual(meta.rows, (row,))
+        self.assertEqual(meta.block_ids, [7])
+        self.assertEqual(meta.keys, ["key"])
+        self.assertEqual(meta.all_buffers, [[100, 200]])
+        self.assertEqual(meta.all_sizes, [[16, 8]])
+        self.assertEqual(meta.all_offsets, [[32, 48]])
+        self.assertEqual(meta.row_req_ids, ["r1"])
+        with self.assertRaises(FrozenInstanceError):
+            row.key = "changed"  # type: ignore[misc]
+        with self.assertRaises(AttributeError):
+            meta.keys = ["changed"]  # type: ignore[misc]
+
+    def test_layer_range_metadata_rejects_misaligned_legacy_rows(self):
+        with self.assertRaisesRegex(ValueError, "row metadata must align"):
+            LayerRangeReqMeta(
+                ["r1"],
+                2,
+                [7],
+                ["key", "extra-key"],
+                [[100]],
+                [[16]],
+                [[32]],
+            )
+
+    def test_layer_range_metadata_rejects_misaligned_segments(self):
+        with self.assertRaisesRegex(ValueError, "row segments must align"):
+            LayerRangeReqMeta(
+                ["r1"],
+                2,
+                [7],
+                ["key"],
+                [[100, 200]],
+                [[16]],
+                [[32]],
+            )
 
     def test_layer_transfer_task_keeps_explicit_batch_kind(self):
         task = LayerTransferTask(

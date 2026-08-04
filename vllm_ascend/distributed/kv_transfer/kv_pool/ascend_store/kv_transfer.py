@@ -31,6 +31,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
     LayerLoadTask,
     LayerMultiBlockReqMeta,
     LayerRangeReqMeta,
+    LayerRangeRow,
     LayerSaveTask,
     SharedBlockData,
     LayerTransferArrays,
@@ -540,17 +541,29 @@ class LayerBatchBuilder:
             all_buffers = [
                 (layer_base_addrs + block_id * layer_block_stride).tolist() for block_id in shared.block_ids_arr
             ]
+            rows = tuple(
+                LayerRangeRow(
+                    req_id=req_id,
+                    block_id=int(block_id),
+                    key=key,
+                    buffers=tuple(int(buffer) for buffer in buffers),
+                    sizes=tuple(int(size) for size in sizes),
+                    offsets=tuple(int(offset) for offset in offsets),
+                )
+                for req_id, block_id, key, buffers in zip(
+                    shared.row_req_ids,
+                    shared.block_ids_arr,
+                    shared.block_keys,
+                    all_buffers,
+                    strict=True,
+                )
+            )
             return LayerRangeReqMeta(
                 req_ids=shared.req_ids,
                 layer_id=layer_id,
                 group_id=self.group_id,
-                block_ids=shared.block_ids_arr.tolist(),
-                keys=shared.block_keys,
-                all_buffers=all_buffers,
-                all_sizes=[sizes.copy() for _ in shared.block_ids_arr],
-                all_offsets=[offsets.copy() for _ in shared.block_ids_arr],
                 load_keys=shared.load_keys,
-                row_req_ids=shared.row_req_ids,
+                rows=rows,
             )
 
         assert shared.block_gvas_arr is not None
@@ -2193,45 +2206,60 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         # Every layer is built from the same SharedBlockData row order, so a
         # row index identifies one key/local-block destination across layers.
         if group_id not in self._active_load_indices_by_group or local_layer_id == 0:
-            self._active_load_indices_by_group[group_id] = set(range(len(req_meta.keys)))
+            self._active_load_indices_by_group[group_id] = set(range(len(req_meta.rows)))
 
         active_load_indices = self._active_load_indices_by_group[group_id]
         active_indices = [
             index
-            for index in range(len(req_meta.keys))
+            for index in range(len(req_meta.rows))
             if not self._load_abort_event.is_set() and index in active_load_indices
         ]
-        active_keys = [req_meta.keys[index] for index in active_indices]
-        if active_keys:
+        if active_indices:
             self._stagger_h2d_submit(physical_layer_id)
-            active_sizes = [req_meta.all_sizes[index] for index in active_indices]
-            active_offsets = [req_meta.all_offsets[index] for index in active_indices]
-            if req_meta.row_req_ids and len(req_meta.row_req_ids) != len(req_meta.keys):
-                raise RuntimeError("Mooncake range row ownership does not align with keys")
             # Keep Mooncake's key-major batching within one request. Mixing
             # destinations from concurrent requests can corrupt a target row.
-            indices_by_request: dict[str | None, list[int]] = {}
+            indices_by_request: dict[str, list[int]] = {}
             for index in active_indices:
-                req_id = req_meta.row_req_ids[index] if req_meta.row_req_ids else None
-                indices_by_request.setdefault(req_id, []).append(index)
+                indices_by_request.setdefault(req_meta.rows[index].req_id, []).append(index)
 
             results_by_index: dict[int, int] = {}
-            for request_indices in indices_by_request.values():
-                request_keys = [req_meta.keys[index] for index in request_indices]
-                request_results = require_aligned_batch_results(
-                    "batch_copy_get",
-                    request_keys,
-                    self.m_store.batch_copy_get(
+            for req_id, request_indices in indices_by_request.items():
+                request_rows = [req_meta.rows[index] for index in request_indices]
+                request_keys = [row.key for row in request_rows]
+                try:
+                    request_results = require_aligned_batch_results(
+                        "batch_copy_get",
                         request_keys,
-                        [req_meta.all_buffers[index] for index in request_indices],
-                        [req_meta.all_sizes[index] for index in request_indices],
-                        [req_meta.all_offsets[index] for index in request_indices],
-                    ),
-                )
+                        self.m_store.batch_copy_get(
+                            request_keys,
+                            [list(row.buffers) for row in request_rows],
+                            [list(row.sizes) for row in request_rows],
+                            [list(row.offsets) for row in request_rows],
+                        ),
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Layerwise load request range failed layer=%d group=%d request=%s error=%s",
+                        physical_layer_id,
+                        group_id,
+                        req_id,
+                        exc,
+                    )
+                    self._mark_invalid_range_indices(req_meta, request_indices)
+                    active_load_indices.difference_update(request_indices)
+                    continue
                 results_by_index.update(zip(request_indices, request_results, strict=True))
-            results = [results_by_index[index] for index in active_indices]
-            _emit_range_debug_event("load", physical_layer_id, active_sizes, active_offsets, results)
-            failed_indices = [index for index, result in zip(active_indices, results, strict=True) if result < 0]
+
+            returned_indices = [index for index in active_indices if index in results_by_index]
+            if returned_indices:
+                _emit_range_debug_event(
+                    "load",
+                    physical_layer_id,
+                    [list(req_meta.rows[index].sizes) for index in returned_indices],
+                    [list(req_meta.rows[index].offsets) for index in returned_indices],
+                    [results_by_index[index] for index in returned_indices],
+                )
+            failed_indices = [index for index, result in results_by_index.items() if result < 0]
             if failed_indices:
                 self._mark_invalid_range_indices(req_meta, failed_indices)
                 # A negative ranged result belongs to one destination row; it
