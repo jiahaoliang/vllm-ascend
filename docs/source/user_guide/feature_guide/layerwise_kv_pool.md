@@ -275,6 +275,45 @@ On multi-TP deployments, H2D (host-to-device) copies for all TP ranks can
 contend on the PCIe/HCCS bus. Set `h2d_stagger_us` to spread them out (e.g.
 `100` for a 100 µs stagger between ranks).
 
+### Nightly Ranged-Transfer Performance Gate
+
+The opt-in nightly gate uses real registered NPU buffers and a configured
+Mooncake Client. It measures ranged save as one key batch per layer and ranged
+load as one batch per request per layer, matching the request-local load
+dispatch. The threshold unit for `VLLM_ASCEND_NIGHTLY_KVPOOL_MIN_GBPS` is
+decimal GB/s; `VLLM_ASCEND_NIGHTLY_KVPOOL_MAX_P95_MS` is milliseconds.
+
+Add this section to a normal Mooncake JSON configuration:
+
+```json
+{
+    "range_performance": {
+        "device_index": 0,
+        "layer_count": 8,
+        "request_count": 4,
+        "rows_per_request": 4,
+        "segments_per_row": 2,
+        "segment_bytes": 1048576,
+        "warmup_iterations": 2,
+        "measured_iterations": 10
+    }
+}
+```
+
+Run the gate with explicit thresholds:
+
+```bash
+export VLLM_ASCEND_NIGHTLY_MOONCAKE_CONFIG=/path/to/mooncake-nightly.json
+export VLLM_ASCEND_NIGHTLY_KVPOOL_MIN_GBPS=1.0
+export VLLM_ASCEND_NIGHTLY_KVPOOL_MAX_P95_MS=100
+python3 -m pytest -q -p no:cacheprovider \
+  tests/e2e/nightly/single_node/kv_pool/test_mooncake_layerwise_range_performance.py
+```
+
+The test skips only when the config variable is absent. Once configured, a
+missing NPU or threshold, transfer/session error, data mismatch, performance
+regression, or cleanup failure fails the run.
+
 ## Supported Models
 
 Layerwise mode integrates with the **MLA** (`mla_v1`) and **SFA** (`sfa_v1`)
