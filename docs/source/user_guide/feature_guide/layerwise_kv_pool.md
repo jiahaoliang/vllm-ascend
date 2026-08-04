@@ -34,25 +34,31 @@ than concentrated as a single blocking step.
 ### Chunked Prefill
 
 Mooncake layerwise mode keeps its read-session state across chunked-prefill
-scheduler steps. Before each chunk, the Worker calls `batch_get_start` with the
-request's accumulated load keys. This renews existing leases and opens sessions
-for keys that became COMPLETE after the previous chunk. The current chunk opens
-put sessions only for its new save keys and publishes successful keys with
-`batch_put_end` after the final layer write.
+scheduler steps. Before each chunk, the Worker calls internal
+`Backend.batch_get_start` with the request's accumulated load keys;
+`MooncakeBackend` maps it to Client `batch_get_session_start`. This renews
+existing leases and opens sessions for keys that became COMPLETE after the
+previous chunk. The current chunk opens put sessions only for its new save keys
+and publishes successful keys through internal `Backend.batch_commit`, which
+maps to Client `batch_put_session_end`, after the final layer write.
 
-Intermediate chunks do not call `batch_get_end`. On the last chunk, the Worker
-releases the request after its final ranged read. When concurrently scheduled
-requests share a prefix key, the Worker tracks every active request owner and
-calls `batch_get_end` only after the last owner releases that key.
+Intermediate chunks do not call internal `Backend.batch_get_end`. On the last
+chunk, the Worker releases the request after its final ranged read. When
+concurrently scheduled requests share a prefix key, the Worker tracks every
+active request owner and calls `Backend.batch_get_end` only after the last owner
+releases that key; the Mooncake adapter delegates it to Client
+`batch_get_session_end`.
 
 ## Prerequisites
 
 Layerwise mode supports the **memcache** and **Mooncake** backends. The
 memcache backend requires memcache_hybrid setup; Mooncake requires a Client
-wheel that provides all seven layerwise session and range APIs:
-`batch_put_start`, `batch_put_from_multi_buffer_ranges`, `batch_put_end`,
-`batch_put_revoke`, `batch_get_start`,
-`batch_get_into_multi_buffer_ranges`, and `batch_get_end`. Startup capability
+wheel that provides all seven layerwise session and range Client APIs:
+`batch_put_session_start`, `batch_put_from_multi_buffer_ranges`,
+`batch_put_session_end`, `batch_put_session_revoke`,
+`batch_get_session_start`, `batch_get_into_multi_buffer_ranges`, and
+`batch_get_session_end`. The two ranged-copy Client method names are unchanged;
+the five session-control names include the `session` component. Startup capability
 validation fails explicitly when Mooncake does not implement this contract.
 Within vLLM Ascend, Backend commit/revoke defaults return per-key success.
 Memcache implements these no-ops explicitly because its flat-GVA holes require
@@ -285,8 +291,9 @@ remote object offset for cache segment `j` is
 `layer_id * page_size_bytes + layer_inner_offset[j]`; the local pointer is
 `layer_base_addr[j] + block_id * block_stride[j]`. The Client/Master default
 lease TTL must cover one chunk's ranged reads; each later chunk renews the
-accumulated keys with `batch_get_start`. Mooncake transfer splitting is not
-supported in this initial implementation.
+accumulated keys through internal `Backend.batch_get_start`, which maps to
+Client `batch_get_session_start`. Mooncake transfer splitting is not supported
+in this initial implementation.
 
 SSD selection remains controlled by the existing Mooncake configuration.
 vLLM Ascend does not disable SSD and does not guarantee that every SSD replica

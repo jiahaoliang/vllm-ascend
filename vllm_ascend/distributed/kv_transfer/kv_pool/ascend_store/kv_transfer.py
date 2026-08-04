@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ctypes
-import json
 import logging
 import queue
 import threading
@@ -17,7 +16,6 @@ from vllm.distributed.kv_events import BlockStored
 from vllm.logger import logger
 from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
 
-from vllm_ascend import envs
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend import (
     Backend,
     require_aligned_batch_results,
@@ -51,72 +49,12 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_transfer
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mooncake_session_tracker import (
     MooncakeSessionTracker,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.range_debug import (
+    emit_commit_event,
+    emit_range_event,
+)
 
 _H2D_STAGGER_SPIN_US = 50
-_KVPOOL_RANGE_DEBUG_PREFIX = "[KVPOOL_RANGE_DEBUG]"
-
-
-def _build_range_debug_payload(
-    direction: str,
-    layer_id: int,
-    sizes: list[list[int]],
-    object_offsets: list[list[int]],
-    results: list[int],
-) -> dict[str, Any]:
-    nested_sizes = [[int(size) for size in key_sizes] for key_sizes in sizes]
-    return {
-        "event": "range",
-        "direction": direction,
-        "layer_id": int(layer_id),
-        "key_count": len(results),
-        "requested_bytes": [sum(key_sizes) for key_sizes in nested_sizes],
-        "sizes": nested_sizes,
-        "object_offsets": [[int(offset) for offset in key_offsets] for key_offsets in object_offsets],
-        "results": [int(result) for result in results],
-    }
-
-
-def _emit_range_debug_event(
-    direction: str,
-    layer_id: int,
-    sizes: list[list[int]],
-    object_offsets: list[list[int]],
-    results: list[int],
-) -> None:
-    try:
-        if not envs.VLLM_ASCEND_KVPOOL_RANGE_DEBUG:
-            return
-        payload = _build_range_debug_payload(direction, layer_id, sizes, object_offsets, results)
-        logger.info(
-            "%s %s",
-            _KVPOOL_RANGE_DEBUG_PREFIX,
-            json.dumps(payload, separators=(",", ":")),
-        )
-    except Exception:
-        pass
-
-
-def _emit_commit_debug_event(
-    layer_id: int,
-    key_count: int,
-    results: list[int],
-) -> None:
-    try:
-        if not envs.VLLM_ASCEND_KVPOOL_RANGE_DEBUG:
-            return
-        payload = {
-            "event": "commit",
-            "layer_id": int(layer_id),
-            "key_count": int(key_count),
-            "results": [int(result) for result in results],
-        }
-        logger.info(
-            "%s %s",
-            _KVPOOL_RANGE_DEBUG_PREFIX,
-            json.dumps(payload, separators=(",", ":")),
-        )
-    except Exception:
-        pass
 
 
 @dataclass(frozen=True)
@@ -1805,7 +1743,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                     active_offsets,
                 ),
             )
-            _emit_range_debug_event("save", physical_layer_id, active_sizes, active_offsets, results)
+            emit_range_event("save", physical_layer_id, active_sizes, active_offsets, results)
             failed_keys = [key for key, result in zip(active_keys, results, strict=True) if result < 0]
             if failed_keys:
                 # A ranged-write failure only invalidates this key; remaining
@@ -1823,7 +1761,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                         active_keys,
                         self.m_store.batch_commit(active_keys),
                     )
-                    _emit_commit_debug_event(physical_layer_id, len(active_keys), commit_results)
+                    emit_commit_event(physical_layer_id, len(active_keys), commit_results)
                 except Exception as exc:
                     logger.error(
                         "Layerwise commit raised keys=%s error=%s",
@@ -2252,7 +2190,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
 
             returned_indices = [index for index in active_indices if index in results_by_index]
             if returned_indices:
-                _emit_range_debug_event(
+                emit_range_event(
                     "load",
                     physical_layer_id,
                     [list(req_meta.rows[index].sizes) for index in returned_indices],
