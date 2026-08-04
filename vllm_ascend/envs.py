@@ -121,6 +121,18 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Emit per-layer KVPool ranged transfer audit events. Default: 0 (disabled).
     # Valid values: 0 or 1. This configuration is not sensitive.
     "VLLM_ASCEND_KVPOOL_RANGE_DEBUG": lambda: _strict_binary_env("VLLM_ASCEND_KVPOOL_RANGE_DEBUG"),
+    # Path to a non-sensitive Mooncake nightly benchmark JSON file. Default:
+    # None (the opt-in benchmark is skipped). A non-empty readable file path is
+    # required when the benchmark is enabled.
+    "VLLM_ASCEND_NIGHTLY_MOONCAKE_CONFIG": lambda: os.getenv("VLLM_ASCEND_NIGHTLY_MOONCAKE_CONFIG", None),
+    # Non-sensitive minimum decimal GB/s threshold for the Mooncake nightly
+    # ranged-transfer benchmark. Default: None. Valid values are positive,
+    # finite decimal numbers.
+    "VLLM_ASCEND_NIGHTLY_KVPOOL_MIN_GBPS": lambda: os.getenv("VLLM_ASCEND_NIGHTLY_KVPOOL_MIN_GBPS", None),
+    # Non-sensitive maximum p95 latency threshold in milliseconds for the
+    # Mooncake nightly ranged-transfer benchmark. Default: None. Valid values
+    # are positive, finite decimal numbers.
+    "VLLM_ASCEND_NIGHTLY_KVPOOL_MAX_P95_MS": lambda: os.getenv("VLLM_ASCEND_NIGHTLY_KVPOOL_MAX_P95_MS", None),
 }
 
 # end-env-vars-definition

@@ -1637,15 +1637,15 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         if self._active_put_keys is None or layer_id == 0:
             # This mutable set is scoped to one forward batch. Keep the shared
             # metadata immutable so later layers can filter failed keys safely.
-            self._active_put_keys = set(req_meta.keys)
-        active_indices = [index for index, key in enumerate(req_meta.keys) if key in self._active_put_keys]
-        active_keys = [req_meta.keys[index] for index in active_indices]
+            self._active_put_keys = {row.key for row in req_meta.rows}
+        active_rows = [row for row in req_meta.rows if row.key in self._active_put_keys]
+        active_keys = [row.key for row in active_rows]
         if active_keys:
             if layer_id < len(self.sync_save_events):
                 self.sync_save_events[layer_id].synchronize()
-            active_buffers = [req_meta.all_buffers[index] for index in active_indices]
-            active_sizes = [req_meta.all_sizes[index] for index in active_indices]
-            active_offsets = [req_meta.all_offsets[index] for index in active_indices]
+            active_buffers = [list(row.buffers) for row in active_rows]
+            active_sizes = [list(row.sizes) for row in active_rows]
+            active_offsets = [list(row.offsets) for row in active_rows]
             results = require_aligned_batch_results(
                 "batch_copy_put",
                 active_keys,
@@ -1666,7 +1666,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
 
         if layer_id == self.final_layer_id:
             # Only keys that completed every layer range may publish COMPLETE.
-            active_keys = [key for key in req_meta.keys if key in self._active_put_keys]
+            active_keys = [row.key for row in req_meta.rows if row.key in self._active_put_keys]
             if active_keys:
                 try:
                     commit_results = require_aligned_batch_results(
