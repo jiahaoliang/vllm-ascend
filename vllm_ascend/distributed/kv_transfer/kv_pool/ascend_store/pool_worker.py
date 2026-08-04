@@ -344,10 +344,7 @@ class KVPoolWorker:
             self.head_or_tp_rank,
             self.hash_block_size,
             enabled=self.use_memcache_gva_layerwise,
-            can_allocate=(
-                is_kv_save_role(self.kv_role, self.consumer_is_to_put)
-                and self.tp_rank % self.put_step == 0
-            ),
+            can_allocate=(is_kv_save_role(self.kv_role, self.consumer_is_to_put) and self.tp_rank % self.put_step == 0),
             num_groups=self.num_kv_cache_groups,
         )
         self._layer_load_preparation: LayerwisePreparation | None = None
@@ -1078,11 +1075,7 @@ class KVPoolWorker:
             for request in requests:
                 can_save = rank_can_save and request.can_save is not None and request.can_save
                 mooncake_load_slots = (
-                    [
-                        index
-                        for index, key in enumerate(request.load_block_keys)
-                        if key is not None
-                    ]
+                    [index for index, key in enumerate(request.load_block_keys) if key is not None]
                     if use_key_major_ranges
                     else []
                 )
@@ -1127,14 +1120,11 @@ class KVPoolWorker:
                         if self.layerwise_offload:
                             cached_start_block = (
                                 request.load_spec.vllm_cached_tokens // block_size
-                                if request.load_spec is not None
-                                and request.load_spec.can_load
+                                if request.load_spec is not None and request.load_spec.can_load
                                 else 0
                             )
                             hbm_tail_slots = [
-                                block_index
-                                for block_index in mooncake_load_slots
-                                if block_index >= cached_start_block
+                                block_index for block_index in mooncake_load_slots if block_index >= cached_start_block
                             ]
                             if hbm_tail_slots:
                                 plan.hbm_tail_load_ranges.append(
@@ -1155,17 +1145,15 @@ class KVPoolWorker:
                     hash_count = group_hash_count if self.use_block_key_layerwise else len(request.block_hashes)
                     full_blocks = min(cached_full_blocks, hash_count)
                     needs_last_block_at_boundary = (
-                        cached_tokens > 0
-                        and cached_tokens % block_size == 0
-                        and full_blocks < cached_full_blocks
+                        cached_tokens > 0 and cached_tokens % block_size == 0 and full_blocks < cached_full_blocks
                     )
-                    if use_key_major_ranges and request.load_last_block_key is not None and (
-                        cached_tokens % block_size != 0 or needs_last_block_at_boundary
+                    if (
+                        use_key_major_ranges
+                        and request.load_last_block_key is not None
+                        and (cached_tokens % block_size != 0 or needs_last_block_at_boundary)
                     ):
                         partial_block_index = (
-                            cached_full_blocks
-                            if cached_tokens % block_size != 0
-                            else cached_full_blocks - 1
+                            cached_full_blocks if cached_tokens % block_size != 0 else cached_full_blocks - 1
                         )
                         if partial_block_index < load_start_block:
                             partial_block_index = None
@@ -1183,8 +1171,7 @@ class KVPoolWorker:
                             cached_start_block = request.load_spec.vllm_cached_tokens // block_size
                             tail_partial_block_index = (
                                 partial_block_index
-                                if partial_block_index is not None
-                                and partial_block_index >= cached_start_block
+                                if partial_block_index is not None and partial_block_index >= cached_start_block
                                 else None
                             )
                             if cached_start_block < full_blocks or tail_partial_block_index is not None:
@@ -1207,12 +1194,7 @@ class KVPoolWorker:
             return
         for group_id in range(self.num_kv_cache_groups):
             first_task = next(
-                (
-                    task
-                    for layer_tasks in self.layer_save_tasks
-                    for task in layer_tasks
-                    if task.group_id == group_id
-                ),
+                (task for layer_tasks in self.layer_save_tasks for task in layer_tasks if task.group_id == group_id),
                 None,
             )
             if first_task is None:
@@ -1231,12 +1213,7 @@ class KVPoolWorker:
             return
         for group_id in range(self.num_kv_cache_groups):
             first_task = next(
-                (
-                    task
-                    for layer_tasks in self.layer_load_tasks
-                    for task in layer_tasks
-                    if task.group_id == group_id
-                ),
+                (task for layer_tasks in self.layer_load_tasks for task in layer_tasks if task.group_id == group_id),
                 None,
             )
             if first_task is None:
@@ -1261,10 +1238,13 @@ class KVPoolWorker:
 
     def _is_layerwise_save_owner(self) -> bool:
         """Return whether this rank owns layerwise save tasks and put sessions."""
-        return is_kv_save_role(
-            self.kv_role,
-            self.consumer_is_to_put,
-        ) and self.tp_rank % self.put_step == 0
+        return (
+            is_kv_save_role(
+                self.kv_role,
+                self.consumer_is_to_put,
+            )
+            and self.tp_rank % self.put_step == 0
+        )
 
     def _record_timed_out_layer_load_blocks(self, layer_id: int) -> None:
         """Mark every local block covered by a timed-out layer transfer invalid."""
@@ -1323,9 +1303,7 @@ class KVPoolWorker:
         request_ids_by_key: dict[str, set[str]],
     ) -> None:
         with self._load_session_lock:
-            keys_to_end = self._mooncake_session_tracker.release_failed_get_attempts(
-                request_ids_by_key
-            )
+            keys_to_end = self._mooncake_session_tracker.release_failed_get_attempts(request_ids_by_key)
             self._end_mooncake_load_keys(keys_to_end)
 
     def _finish_current_mooncake_load_sessions(self) -> None:
@@ -1345,16 +1323,13 @@ class KVPoolWorker:
         """Open Mooncake per-key write/read sessions before layer threads run."""
         self._layer_load_aborted.clear()
         self._current_mooncake_request_ids = {request.req_id for request in requests}
-        self._current_mooncake_last_chunk_req_ids = {
-            request.req_id for request in requests if request.is_last_chunk
-        }
+        self._current_mooncake_last_chunk_req_ids = {request.req_id for request in requests if request.is_last_chunk}
         get_key_slots: list[tuple[ReqMeta, str, int, int | None]] = []
         for request in requests:
             # Read sessions belong to each worker Client, including TP ranks
             # that do not own the shared MLA put session.
             get_key_slots.extend(
-                (request, key, block_id, slot)
-                for key, block_id, slot in self._prepare_mooncake_get_session(request)
+                (request, key, block_id, slot) for key, block_id, slot in self._prepare_mooncake_get_session(request)
             )
         self._open_mooncake_get_sessions(get_key_slots)
         for request in requests:
@@ -1442,11 +1417,7 @@ class KVPoolWorker:
 
         self._mooncake_session_tracker.register_put_keys(
             request.req_id,
-            (
-                (key, block_index)
-                for key, _, block_index in key_slots
-                if key in started
-            ),
+            ((key, block_index) for key, _, block_index in key_slots if key in started),
         )
 
     def _prepare_mooncake_get_session(self, request: ReqMeta) -> list[tuple[str, int, int | None]]:
@@ -1467,9 +1438,7 @@ class KVPoolWorker:
                     (
                         make_layerwise_block_key(
                             self.model_name,
-                            self._layerwise_block_tail(
-                                request.block_hashes[block_index]
-                            ),
+                            self._layerwise_block_tail(request.block_hashes[block_index]),
                             self.head_or_tp_rank,
                         ),
                         block_index,
@@ -1479,11 +1448,7 @@ class KVPoolWorker:
             needs_last_block = cached_tokens % self.block_size != 0 or (
                 cached_tokens > 0 and end_block < cached_full_blocks
             )
-            partial_block_index = (
-                cached_full_blocks
-                if cached_tokens % self.block_size
-                else cached_full_blocks - 1
-            )
+            partial_block_index = cached_full_blocks if cached_tokens % self.block_size else cached_full_blocks - 1
             if needs_last_block and 0 <= partial_block_index < len(request.block_ids):
                 current_entries.append(
                     (
@@ -1501,23 +1466,17 @@ class KVPoolWorker:
             current_entries,
         )
         valid_entries = [
-            (key, block_index)
-            for key, block_index in load_entries
-            if 0 <= block_index < len(request.block_ids)
+            (key, block_index) for key, block_index in load_entries if 0 <= block_index < len(request.block_ids)
         ]
         if not valid_entries:
             return []
 
         request.load_key_block_offset = 0
-        request.load_block_keys = [None] * (
-            max(block_index for _, block_index in valid_entries) + 1
-        )
+        request.load_block_keys = [None] * (max(block_index for _, block_index in valid_entries) + 1)
         key_slots: list[tuple[str, int, int | None]] = []
         for key, block_index in valid_entries:
             request.load_block_keys[block_index] = key
-            key_slots.append(
-                (key, request.block_ids[block_index], block_index)
-            )
+            key_slots.append((key, request.block_ids[block_index], block_index))
 
         return key_slots
 
@@ -1721,8 +1680,7 @@ class KVPoolWorker:
                 is_finish = self.layer_load_finished_events[self.current_layer].wait(timeout=10)
                 if not is_finish:
                     raise TimeoutError(
-                        "Mooncake layerwise load did not drain after abort; "
-                        "refusing to close the in-flight get session"
+                        "Mooncake layerwise load did not drain after abort; refusing to close the in-flight get session"
                     )
         else:
             while not self.layer_load_finished_events[self.current_layer].wait(timeout=10):
@@ -1731,8 +1689,10 @@ class KVPoolWorker:
             is_finish = True
         logger.debug(">>>>>>>>>>>>>>>>>>>> clear load layer %d", self.current_layer)
         self.layer_load_finished_events[self.current_layer].clear()
-        if self.backend_name == "mooncake" and is_finish and (
-            self._layer_load_aborted.is_set() or self.current_layer == self.num_layers - 1
+        if (
+            self.backend_name == "mooncake"
+            and is_finish
+            and (self._layer_load_aborted.is_set() or self.current_layer == self.num_layers - 1)
         ):
             self._finish_current_mooncake_load_sessions()
         if not is_kv_save_role(self.kv_role, self.consumer_is_to_put):
@@ -2033,9 +1993,7 @@ class KVPoolWorker:
             else:
                 release_load_leases()
         if self.use_block_key_layerwise and self.backend_name == "mooncake":
-            self._release_mooncake_requests_terminal(
-                finished_req_ids | meta.preempted_req_ids
-            )
+            self._release_mooncake_requests_terminal(finished_req_ids | meta.preempted_req_ids)
         if self.kv_send_thread is not None:
             send_thread = self.kv_send_thread
             for req_id in meta.preempted_req_ids:

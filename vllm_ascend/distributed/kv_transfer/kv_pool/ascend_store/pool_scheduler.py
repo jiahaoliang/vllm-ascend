@@ -359,9 +359,7 @@ class KVPoolScheduler:
 
             group_key_start = len(query_keys)
             for block_hash in group_block_hashes:
-                query_keys.extend(
-                    self._make_layerwise_gva_keys_for_hit_check(group_id, block_hash_to_str(block_hash))
-                )
+                query_keys.extend(self._make_layerwise_gva_keys_for_hit_check(group_id, block_hash_to_str(block_hash)))
             query_plans.append(
                 (
                     group_key_start,
@@ -391,8 +389,7 @@ class KVPoolScheduler:
         exists = np.asarray(exists_states, dtype=np.int8)
         if np.any((exists != 0) & (exists != 1)):
             raise RuntimeError(
-                f"KV pool layerwise exists check failed for request {request.request_id}: "
-                f"states={exists_states}"
+                f"KV pool layerwise exists check failed for request {request.request_id}: states={exists_states}"
             )
         ranks_per_block = self.tp_size // self.put_step
         hits_per_group: list[int] = []

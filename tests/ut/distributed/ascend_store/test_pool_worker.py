@@ -2815,9 +2815,7 @@ class TestKVPoolWorkerMooncakeLayerSessions(unittest.TestCase):
 
         worker._prepare_mooncake_layerwise_sessions([second_chunk])
 
-        worker.m_store.batch_get_start.assert_called_once_with(
-            ["model@0a@0", "model@0b@0"]
-        )
+        worker.m_store.batch_get_start.assert_called_once_with(["model@0a@0", "model@0b@0"])
         self.assertEqual(
             second_chunk.load_block_keys,
             ["model@0a@0", "model@0b@0"],
@@ -2865,9 +2863,7 @@ class TestKVPoolWorkerMooncakeLayerSessions(unittest.TestCase):
         worker._prepare_mooncake_layerwise_sessions([first, second])
 
         session_calls = [
-            call[0]
-            for call in worker.m_store.method_calls
-            if call[0] in {"batch_get_start", "batch_put_start"}
+            call[0] for call in worker.m_store.method_calls if call[0] in {"batch_get_start", "batch_put_start"}
         ]
         self.assertEqual(
             session_calls,
@@ -2996,9 +2992,7 @@ class TestKVPoolWorkerMooncakeLayerSessions(unittest.TestCase):
                 elif failure == "malformed":
                     worker.m_store.batch_put_start.return_value = []
                 else:
-                    worker.m_store.batch_put_start.side_effect = RuntimeError(
-                        "put start failed"
-                    )
+                    worker.m_store.batch_put_start.side_effect = RuntimeError("put start failed")
                 request = ReqMeta(
                     req_id="r1",
                     token_len_chunk=8,
@@ -3011,16 +3005,12 @@ class TestKVPoolWorkerMooncakeLayerSessions(unittest.TestCase):
                 worker.process_layer_data([request])
 
                 self.assertIsNone(request.save_last_block_key)
-                expected_pending = (
-                    set() if failure == "negative" else {"model@r1_lastblock@0"}
-                )
+                expected_pending = set() if failure == "negative" else {"model@r1_lastblock@0"}
                 self.assertEqual(worker._put_started_keys, expected_pending)
                 if failure == "negative":
                     worker.kv_send_thread.add_revoke_request.assert_not_called()
                 else:
-                    worker.kv_send_thread.add_revoke_request.assert_called_once_with(
-                        ["model@r1_lastblock@0"]
-                    )
+                    worker.kv_send_thread.add_revoke_request.assert_called_once_with(["model@r1_lastblock@0"])
                 worker.m_store.batch_revoke.assert_not_called()
                 self.assertEqual(len(worker.layer_save_tasks), 2)
                 for layer_tasks in worker.layer_save_tasks:
@@ -3058,12 +3048,8 @@ class TestKVPoolWorkerMooncakeLayerSessions(unittest.TestCase):
                 worker.kv_send_thread.add_request.side_effect = lambda request, worker=worker: (
                     worker.layer_save_finished_events[request.layer_id].set()
                 )
-                worker._mooncake_session_tracker.prepare_load_entries(
-                    "r1", [("key-1", 0)]
-                )
-                worker._mooncake_session_tracker.record_get_result(
-                    "key-1", {"r1"}, succeeded=True
-                )
+                worker._mooncake_session_tracker.prepare_load_entries("r1", [("key-1", 0)])
+                worker._mooncake_session_tracker.record_get_result("key-1", {"r1"}, succeeded=True)
                 worker._current_mooncake_request_ids = {"r1"}
                 worker._current_mooncake_last_chunk_req_ids = {"r1"}
                 worker.m_store.batch_get_end.return_value = 0
@@ -3100,13 +3086,9 @@ class TestKVPoolWorkerMooncakeLayerSessions(unittest.TestCase):
         self.assertEqual(request.load_keys, ["model@0a@0"])
         self.assertEqual(worker._put_started_keys, {"model@0a@0"})
         self.assertEqual(worker._invalid_block_ids, {11})
-        worker.m_store.batch_put_start.assert_called_once_with(
-            ["model@0a@0", "model@0b@0"], [128, 128]
-        )
+        worker.m_store.batch_put_start.assert_called_once_with(["model@0a@0", "model@0b@0"], [128, 128])
         session_calls = [
-            call[0]
-            for call in worker.m_store.method_calls
-            if call[0] in {"batch_get_start", "batch_put_start"}
+            call[0] for call in worker.m_store.method_calls if call[0] in {"batch_get_start", "batch_put_start"}
         ]
         self.assertEqual(
             session_calls,
@@ -3133,9 +3115,7 @@ class TestKVPoolWorkerMooncakeLayerSessions(unittest.TestCase):
 
         worker._prepare_mooncake_layerwise_sessions([first_request, second_request])
 
-        worker.m_store.batch_get_start.assert_called_once_with(
-            ["model@0a@0", "model@0b@0", "model@0c@0"]
-        )
+        worker.m_store.batch_get_start.assert_called_once_with(["model@0a@0", "model@0b@0", "model@0c@0"])
         self.assertEqual(first_request.load_block_keys, ["model@0a@0", None])
         self.assertEqual(second_request.load_block_keys, ["model@0a@0", "model@0c@0"])
         self.assertEqual(first_request.load_keys, ["model@0a@0"])
@@ -3144,9 +3124,7 @@ class TestKVPoolWorkerMooncakeLayerSessions(unittest.TestCase):
         worker._release_mooncake_requests_terminal({"r1"})
         worker.m_store.batch_get_end.assert_not_called()
         worker._release_mooncake_requests_terminal({"r2"})
-        worker.m_store.batch_get_end.assert_called_once_with(
-            ["model@0a@0", "model@0c@0"]
-        )
+        worker.m_store.batch_get_end.assert_called_once_with(["model@0a@0", "model@0c@0"])
 
     def test_prepare_sessions_fans_out_shared_load_key_failures(self):
         worker = self._make_worker()
@@ -3175,15 +3153,9 @@ class TestKVPoolWorkerMooncakeLayerSessions(unittest.TestCase):
 
     def test_request_release_owns_batch_get_end_once(self):
         worker = self._make_worker()
-        worker._mooncake_session_tracker.prepare_load_entries(
-            "r1", [("key-1", 0), ("key-2", 1)]
-        )
-        worker._mooncake_session_tracker.record_get_result(
-            "key-1", {"r1"}, succeeded=True
-        )
-        worker._mooncake_session_tracker.record_get_result(
-            "key-2", {"r1"}, succeeded=True
-        )
+        worker._mooncake_session_tracker.prepare_load_entries("r1", [("key-1", 0), ("key-2", 1)])
+        worker._mooncake_session_tracker.record_get_result("key-1", {"r1"}, succeeded=True)
+        worker._mooncake_session_tracker.record_get_result("key-2", {"r1"}, succeeded=True)
 
         worker._release_mooncake_requests_terminal({"r1"})
         worker._release_mooncake_requests_terminal({"r1"})
@@ -3195,12 +3167,8 @@ class TestKVPoolWorkerMooncakeLayerSessions(unittest.TestCase):
         worker.kv_send_thread = None
         worker.kv_recv_thread = None
         worker.load_async = False
-        worker._mooncake_session_tracker.prepare_load_entries(
-            "r1", [("key-1", 0)]
-        )
-        worker._mooncake_session_tracker.record_get_result(
-            "key-1", {"r1"}, succeeded=True
-        )
+        worker._mooncake_session_tracker.prepare_load_entries("r1", [("key-1", 0)])
+        worker._mooncake_session_tracker.record_get_result("key-1", {"r1"}, succeeded=True)
         metadata = AscendConnectorMetadata(set(), {"r1"})
 
         worker.get_finished(set(), metadata)
@@ -3217,12 +3185,8 @@ class TestKVPoolWorkerMooncakeLayerSessions(unittest.TestCase):
         worker.layer_load_tasks = [[], [MagicMock()]]
         worker.layer_load_finished_events = [MagicMock(), MagicMock()]
         worker.layer_load_finished_events[1].wait.return_value = True
-        worker._mooncake_session_tracker.prepare_load_entries(
-            "r1", [("key-1", 0)]
-        )
-        worker._mooncake_session_tracker.record_get_result(
-            "key-1", {"r1"}, succeeded=True
-        )
+        worker._mooncake_session_tracker.prepare_load_entries("r1", [("key-1", 0)])
+        worker._mooncake_session_tracker.record_get_result("key-1", {"r1"}, succeeded=True)
         worker._current_mooncake_request_ids = {"r1"}
         worker._current_mooncake_last_chunk_req_ids = {"r1"}
         worker._submit_ready_layer_loads = MagicMock()
@@ -3237,12 +3201,8 @@ class TestKVPoolWorkerMooncakeLayerSessions(unittest.TestCase):
         worker.layer_load_tasks = [[MagicMock()], []]
         worker.layer_load_finished_events = [MagicMock(), MagicMock()]
         worker.layer_load_finished_events[0].wait.return_value = True
-        worker._mooncake_session_tracker.prepare_load_entries(
-            "r1", [("key-1", 0)]
-        )
-        worker._mooncake_session_tracker.record_get_result(
-            "key-1", {"r1"}, succeeded=True
-        )
+        worker._mooncake_session_tracker.prepare_load_entries("r1", [("key-1", 0)])
+        worker._mooncake_session_tracker.record_get_result("key-1", {"r1"}, succeeded=True)
         worker._current_mooncake_request_ids = {"r1"}
         worker._layer_load_aborted.set()
         worker._submit_ready_layer_loads = MagicMock()
@@ -3285,12 +3245,8 @@ class TestKVPoolWorkerMooncakeLayerSessions(unittest.TestCase):
 
         completion_event.wait.side_effect = wait_for_completion
         worker.layer_load_finished_events = [MagicMock(), completion_event]
-        worker._mooncake_session_tracker.prepare_load_entries(
-            "r1", [("key-1", 0)]
-        )
-        worker._mooncake_session_tracker.record_get_result(
-            "key-1", {"r1"}, succeeded=True
-        )
+        worker._mooncake_session_tracker.prepare_load_entries("r1", [("key-1", 0)])
+        worker._mooncake_session_tracker.record_get_result("key-1", {"r1"}, succeeded=True)
         worker._current_mooncake_request_ids = {"r1"}
         worker._submit_ready_layer_loads = MagicMock()
 
@@ -3322,12 +3278,8 @@ class TestKVPoolWorkerMooncakeLayerSessions(unittest.TestCase):
         completion_event = MagicMock()
         completion_event.wait.side_effect = [False, False]
         worker.layer_load_finished_events = [completion_event, MagicMock()]
-        worker._mooncake_session_tracker.prepare_load_entries(
-            "r1", [("key-1", 0)]
-        )
-        worker._mooncake_session_tracker.record_get_result(
-            "key-1", {"r1"}, succeeded=True
-        )
+        worker._mooncake_session_tracker.prepare_load_entries("r1", [("key-1", 0)])
+        worker._mooncake_session_tracker.record_get_result("key-1", {"r1"}, succeeded=True)
         worker._current_mooncake_request_ids = {"r1"}
         worker._submit_ready_layer_loads = MagicMock()
 
@@ -3416,9 +3368,7 @@ class TestKVPoolWorkerMooncakeLayerSessions(unittest.TestCase):
 
         self.assertEqual(request.save_block_keys, [None, None])
         self.assertEqual(worker._put_started_keys, {"model@0a@0", "model@0b@0"})
-        worker.kv_send_thread.add_revoke_request.assert_called_once_with(
-            ["model@0a@0", "model@0b@0"]
-        )
+        worker.kv_send_thread.add_revoke_request.assert_called_once_with(["model@0a@0", "model@0b@0"])
         worker.m_store.batch_revoke.assert_not_called()
 
     def test_get_start_shape_error_ends_all_keys_and_marks_all_blocks_invalid(self):

@@ -46,10 +46,7 @@ def test_make_layerwise_block_key_uses_model_block_and_rank():
 
     assert hasattr(config_data, "make_layerwise_block_key")
     assert config_data.make_layerwise_block_key("model", "abc", 0) == "model@abc@0"
-    assert (
-        config_data.make_layerwise_block_key("model", "req_lastblock", 3)
-        == "model@req_lastblock@3"
-    )
+    assert config_data.make_layerwise_block_key("model", "req_lastblock", 3) == "model@req_lastblock@3"
 
 
 class TestBlockKeyLayerwiseTopology(unittest.TestCase):
