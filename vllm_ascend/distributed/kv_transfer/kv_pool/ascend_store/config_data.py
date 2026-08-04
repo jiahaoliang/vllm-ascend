@@ -1089,16 +1089,123 @@ class LayerBatchReqMeta:
     load_keys: list[str] = field(default_factory=list)
 
 
-@dataclass
+@dataclass(frozen=True)
+class LayerRangeRow:
+    req_id: str
+    block_id: int
+    key: str
+    buffers: tuple[int, ...]
+    sizes: tuple[int, ...]
+    offsets: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "block_id", int(self.block_id))
+        object.__setattr__(self, "buffers", tuple(int(value) for value in self.buffers))
+        object.__setattr__(self, "sizes", tuple(int(value) for value in self.sizes))
+        object.__setattr__(self, "offsets", tuple(int(value) for value in self.offsets))
+
+
+@dataclass(init=False)
 class LayerRangeReqMeta:
     req_ids: list[str]
     layer_id: int
-    block_ids: list[int]
-    keys: list[str]
-    all_buffers: list[list[int]]
-    all_sizes: list[list[int]]
-    all_offsets: list[list[int]]
-    load_keys: list[str] = field(default_factory=list)
+    rows: tuple[LayerRangeRow, ...]
+    load_keys: list[str]
+
+    def __init__(
+        self,
+        req_ids: list[str],
+        layer_id: int,
+        block_ids: list[int] | None = None,
+        keys: list[str] | None = None,
+        all_buffers: list[list[int]] | None = None,
+        all_sizes: list[list[int]] | None = None,
+        all_offsets: list[list[int]] | None = None,
+        load_keys: list[str] | None = None,
+        row_req_ids: list[str] | None = None,
+        *,
+        rows: tuple[LayerRangeRow, ...] | list[LayerRangeRow] | None = None,
+    ) -> None:
+        self.req_ids = req_ids
+        self.layer_id = layer_id
+        self.load_keys = load_keys if load_keys is not None else []
+
+        legacy_values = (block_ids, keys, all_buffers, all_sizes, all_offsets)
+        if rows is not None:
+            if any(value is not None for value in legacy_values) or row_req_ids is not None:
+                raise ValueError("rows cannot be combined with legacy range metadata")
+            normalized_rows = tuple(rows)
+        else:
+            if all(value is None for value in legacy_values):
+                normalized_rows = ()
+            elif any(value is None for value in legacy_values):
+                raise ValueError("legacy range metadata fields must be provided together")
+            else:
+                assert block_ids is not None
+                assert keys is not None
+                assert all_buffers is not None
+                assert all_sizes is not None
+                assert all_offsets is not None
+                row_count = len(keys)
+                if not all(len(values) == row_count for values in (block_ids, all_buffers, all_sizes, all_offsets)):
+                    raise ValueError("Mooncake range row metadata must align")
+                if row_req_ids:
+                    if len(row_req_ids) != row_count:
+                        raise ValueError("Mooncake range row ownership must align")
+                    owners = row_req_ids
+                elif row_count == 0:
+                    owners = []
+                elif len(req_ids) == 1:
+                    owners = [req_ids[0]] * row_count
+                else:
+                    raise ValueError("Mooncake range rows require request ownership")
+                normalized_rows = tuple(
+                    LayerRangeRow(
+                        req_id=req_id,
+                        block_id=int(block_id),
+                        key=key,
+                        buffers=tuple(int(buffer) for buffer in buffers),
+                        sizes=tuple(int(size) for size in sizes),
+                        offsets=tuple(int(offset) for offset in offsets),
+                    )
+                    for req_id, block_id, key, buffers, sizes, offsets in zip(
+                        owners,
+                        block_ids,
+                        keys,
+                        all_buffers,
+                        all_sizes,
+                        all_offsets,
+                        strict=True,
+                    )
+                )
+
+        if any(len(row.buffers) != len(row.sizes) or len(row.sizes) != len(row.offsets) for row in normalized_rows):
+            raise ValueError("Mooncake range row segments must align")
+        self.rows = normalized_rows
+
+    @property
+    def block_ids(self) -> list[int]:
+        return [row.block_id for row in self.rows]
+
+    @property
+    def keys(self) -> list[str]:
+        return [row.key for row in self.rows]
+
+    @property
+    def all_buffers(self) -> list[list[int]]:
+        return [list(row.buffers) for row in self.rows]
+
+    @property
+    def all_sizes(self) -> list[list[int]]:
+        return [list(row.sizes) for row in self.rows]
+
+    @property
+    def all_offsets(self) -> list[list[int]]:
+        return [list(row.offsets) for row in self.rows]
+
+    @property
+    def row_req_ids(self) -> list[str]:
+        return [row.req_id for row in self.rows]
 
 
 @dataclass
@@ -1173,6 +1280,7 @@ class SharedBlockData:
     is_last_chunks: list[bool | None]
     block_keys: list[str] | None = None
     load_keys: list[str] = field(default_factory=list)
+    row_req_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
