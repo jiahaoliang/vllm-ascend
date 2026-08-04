@@ -482,6 +482,8 @@ class KVPoolWorker:
                     self.layerwise_max_transfer_bytes,
                     group_array_builders=self._build_group_transfer_array_builders(),
                     load_lease_releaser=self._layerwise_transfer_preparer.release_finished_load_leases,
+                    invalid_block_ids=self._invalid_block_ids,
+                    invalid_block_ids_lock=self._invalid_block_ids_lock,
                 )
             else:
                 self.kv_recv_thread = KVCacheStoreKeyLayerRecvingThread(
