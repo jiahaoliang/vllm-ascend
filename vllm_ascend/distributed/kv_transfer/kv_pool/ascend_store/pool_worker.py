@@ -353,6 +353,7 @@ class KVPoolWorker:
         self._scatter_cursor = 0
         self._early_dispatched: set[int] = set()
         self._put_started_keys: set[str] = set()
+        self._put_revoke_pending_keys: set[str] = set()
         self._put_started_keys_lock = threading.Lock()
         self._load_session_lock = threading.Lock()
         self._layer_load_aborted = threading.Event()
@@ -493,6 +494,7 @@ class KVPoolWorker:
                     layer_attn_recorded_events=self.layer_attn_recorded_events,
                     group_builders=self._build_group_layer_builders(),
                     put_started_keys=self._put_started_keys,
+                    put_revoke_pending_keys=self._put_revoke_pending_keys,
                     put_started_keys_lock=self._put_started_keys_lock,
                     session_tracker=self._mooncake_session_tracker,
                 )
@@ -1260,19 +1262,24 @@ class KVPoolWorker:
                     block_ids.add(request_block_ids[partial_block_index])
         self._record_layerwise_invalid_blocks(list(block_ids))
 
-    def _queue_layerwise_revoke_keys(self, keys: list[str]) -> None:
+    def _queue_layerwise_revoke_keys(
+        self,
+        keys: list[str],
+        *,
+        mark_pending: bool = True,
+    ) -> None:
         if not keys:
             return
+        if mark_pending:
+            with self._put_started_keys_lock:
+                self._put_started_keys.difference_update(keys)
+                self._put_revoke_pending_keys.update(keys)
         try:
             assert self.kv_send_thread is not None
             self.kv_send_thread.add_revoke_request(keys)
         except Exception as exc:
-            # An unbounded queue should not reject this task. If the transfer
-            # thread is unavailable, leave remote PROCESSING cleanup to the
-            # Master timeout and allow a later request to retry PutStart.
+            # Retain pending ownership so a later request can retry cleanup.
             logger.error("Failed to queue Mooncake batch_revoke for keys=%s: %s", keys, exc)
-            with self._put_started_keys_lock:
-                self._put_started_keys.difference_update(keys)
 
     def _end_mooncake_load_keys(self, keys: list[str]) -> None:
         if not keys:
@@ -1376,11 +1383,23 @@ class KVPoolWorker:
         requested_keys = list(dict.fromkeys(key for key, _, _ in key_slots))
         if not requested_keys:
             return
-        # _put_started_keys is process-wide and only suppresses duplicate
-        # PutStart calls. SendingThread removes keys after commit or revoke.
+        # Writable and revoke-pending ownership are process-wide and mutually
+        # exclusive. A pending key fails closed for this request while its
+        # cleanup is requeued for a later PutStart attempt.
         with self._put_started_keys_lock:
             previously_started = set(requested_keys) & self._put_started_keys
-            new_keys = [key for key in requested_keys if key not in self._put_started_keys]
+            revoke_pending = set(requested_keys) & self._put_revoke_pending_keys
+            new_keys = [
+                key
+                for key in requested_keys
+                if key not in self._put_started_keys and key not in self._put_revoke_pending_keys
+            ]
+
+        if revoke_pending:
+            self._queue_layerwise_revoke_keys(
+                [key for key in requested_keys if key in revoke_pending],
+                mark_pending=False,
+            )
 
         started = set(previously_started)
         if new_keys:
@@ -1392,15 +1411,13 @@ class KVPoolWorker:
                 )
             except Exception as exc:
                 logger.error("Mooncake batch_put_start failed for keys=%s: %s", new_keys, exc)
-                # The result shape no longer tells us which remote sessions
-                # were opened. Suppress duplicate PutStart until the ordered
-                # SendingThread control task attempts to revoke every key.
-                with self._put_started_keys_lock:
-                    self._put_started_keys.update(new_keys)
+                # The result shape no longer tells us which local sessions
+                # were opened. Retain uncertain ownership until revoke succeeds.
                 self._queue_layerwise_revoke_keys(new_keys)
             else:
                 newly_started = {key for key, result in zip(new_keys, results, strict=True) if result == 0}
                 with self._put_started_keys_lock:
+                    self._put_revoke_pending_keys.difference_update(newly_started)
                     self._put_started_keys.update(newly_started)
                 started.update(newly_started)
 

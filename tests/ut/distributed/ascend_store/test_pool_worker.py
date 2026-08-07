@@ -294,6 +294,7 @@ class TestKVPoolWorkerThreadSelection(unittest.TestCase):
         worker.layerwise_max_transfer_blocks = 0
         worker.layerwise_max_transfer_bytes = 0
         worker._put_started_keys = set()
+        worker._put_revoke_pending_keys = set()
         worker._put_started_keys_lock = threading.Lock()
         worker._mooncake_session_tracker = MooncakeSessionTracker()
         worker._invalid_block_ids = set()
@@ -2766,6 +2767,7 @@ class TestKVPoolWorkerMooncakeLayerSessions(unittest.TestCase):
         worker._scatter_cursor = 0
         worker._layerwise_pd_transfer_waiter = None
         worker._put_started_keys = set()
+        worker._put_revoke_pending_keys = set()
         worker._put_started_keys_lock = threading.Lock()
         worker._mooncake_session_tracker = MooncakeSessionTracker()
         worker._invalid_block_ids = set()
@@ -3006,7 +3008,8 @@ class TestKVPoolWorkerMooncakeLayerSessions(unittest.TestCase):
 
                 self.assertIsNone(request.save_last_block_key)
                 expected_pending = set() if failure == "negative" else {"model@r1_lastblock@0"}
-                self.assertEqual(worker._put_started_keys, expected_pending)
+                self.assertEqual(worker._put_started_keys, set())
+                self.assertEqual(worker._put_revoke_pending_keys, expected_pending)
                 if failure == "negative":
                     worker.kv_send_thread.add_revoke_request.assert_not_called()
                 else:
@@ -3367,9 +3370,48 @@ class TestKVPoolWorkerMooncakeLayerSessions(unittest.TestCase):
         worker._prepare_mooncake_layerwise_sessions([request])
 
         self.assertEqual(request.save_block_keys, [None, None])
-        self.assertEqual(worker._put_started_keys, {"model@0a@0", "model@0b@0"})
+        self.assertEqual(worker._put_started_keys, set())
+        self.assertEqual(worker._put_revoke_pending_keys, {"model@0a@0", "model@0b@0"})
         worker.kv_send_thread.add_revoke_request.assert_called_once_with(["model@0a@0", "model@0b@0"])
         worker.m_store.batch_revoke.assert_not_called()
+
+    def test_pending_put_key_requeues_cleanup_and_fails_closed(self):
+        worker = self._make_worker()
+        worker._put_revoke_pending_keys.add("model@0a@0")
+        request = ReqMeta(
+            req_id="r1",
+            token_len_chunk=16,
+            save_end_token=16,
+            block_ids=[10],
+            block_hashes=[b"\x0a"],
+            can_save=True,
+        )
+
+        worker._prepare_mooncake_layerwise_sessions([request])
+
+        worker.m_store.batch_put_start.assert_not_called()
+        worker.kv_send_thread.add_revoke_request.assert_called_once_with(["model@0a@0"])
+        self.assertEqual(request.save_block_keys, [None])
+        self.assertEqual(worker._put_started_keys, set())
+        self.assertEqual(worker._put_revoke_pending_keys, {"model@0a@0"})
+
+    def test_revoke_queue_failure_retains_pending_ownership(self):
+        worker = self._make_worker()
+        worker._put_revoke_pending_keys.add("model@0a@0")
+        worker.kv_send_thread.add_revoke_request.side_effect = RuntimeError("queue failed")
+        request = ReqMeta(
+            req_id="r1",
+            token_len_chunk=16,
+            save_end_token=16,
+            block_ids=[10],
+            block_hashes=[b"\x0a"],
+            can_save=True,
+        )
+
+        worker._prepare_mooncake_layerwise_sessions([request])
+
+        self.assertEqual(request.save_block_keys, [None])
+        self.assertEqual(worker._put_revoke_pending_keys, {"model@0a@0"})
 
     def test_get_start_shape_error_ends_all_keys_and_marks_all_blocks_invalid(self):
         worker = self._make_worker()

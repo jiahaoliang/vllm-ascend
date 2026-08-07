@@ -1502,6 +1502,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         layer_attn_recorded_events: list[threading.Event] | None = None,
         group_builders: list[LayerBatchBuilder] | None = None,
         put_started_keys: set[str] | None = None,
+        put_revoke_pending_keys: set[str] | None = None,
         put_started_keys_lock: threading.Lock | None = None,
         session_tracker: MooncakeSessionTracker | None = None,
     ):
@@ -1536,7 +1537,12 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                 group_id=0,
             )
         self._put_started_keys = put_started_keys if put_started_keys is not None else set()
+        self._put_revoke_pending_keys = (
+            put_revoke_pending_keys if put_revoke_pending_keys is not None else set()
+        )
         self._put_started_keys_lock = put_started_keys_lock or threading.Lock()
+        self._put_revoke_queued_keys: set[str] = set()
+        self._put_revoke_inflight_keys: set[str] = set()
         self._session_tracker = session_tracker
         self._active_put_keys: set[str] | None = None
         self.group_builders: list[LayerBatchBuilder] | None = group_builders
@@ -1608,36 +1614,103 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
 
     def add_revoke_request(self, keys: list[str]) -> None:
         deduplicated_keys = tuple(dict.fromkeys(keys))
-        if deduplicated_keys:
-            self.request_queue.put(_LayerRevokeTask(deduplicated_keys))
+        if not deduplicated_keys:
+            return
+        with self._put_started_keys_lock:
+            owned_keys = tuple(
+                key
+                for key in deduplicated_keys
+                if key in self._put_started_keys or key in self._put_revoke_pending_keys
+            )
+            self._put_started_keys.difference_update(owned_keys)
+            self._put_revoke_pending_keys.update(owned_keys)
+            task_keys = tuple(
+                key
+                for key in owned_keys
+                if key not in self._put_revoke_queued_keys and key not in self._put_revoke_inflight_keys
+            )
+            self._put_revoke_queued_keys.update(task_keys)
+        if not task_keys:
+            return
+        try:
+            self.request_queue.put(_LayerRevokeTask(task_keys))
+        except Exception:
+            with self._put_started_keys_lock:
+                self._put_revoke_queued_keys.difference_update(task_keys)
+            raise
 
     def _remove_started_keys(self, keys: list[str]) -> None:
         with self._put_started_keys_lock:
             self._put_started_keys.difference_update(keys)
 
-    def _revoke_range_keys(self, keys: list[str]) -> None:
-        if not keys:
-            return
-        try:
-            results = require_aligned_batch_results("batch_revoke", keys, self.m_store.batch_revoke(keys))
-            if any(result != 0 for result in results):
-                logger.error("Layerwise revoke failed keys=%s results=%s", keys, results)
-        except Exception as exc:
-            logger.error("Layerwise revoke raised keys=%s error=%s", keys, exc)
-        finally:
-            # This tracker only gates future put-start calls. Drop keys after a
-            # revoke attempt even when the remote cleanup fails; the Master TTL
-            # owns any remaining PROCESSING session.
-            self._remove_started_keys(keys)
-            if self._session_tracker is not None:
-                self._session_tracker.revoke_put_keys(keys)
+    def _revoke_range_keys(self, keys: list[str]) -> set[str]:
+        pending_keys = list(dict.fromkeys(keys))
+        if not pending_keys:
+            return set()
+        with self._put_started_keys_lock:
+            self._put_started_keys.difference_update(pending_keys)
+            self._put_revoke_pending_keys.update(pending_keys)
+
+        revoked_keys: set[str] = set()
+        retry_delays = (0.1, 0.5)
+        for attempt in range(3):
+            try:
+                results = require_aligned_batch_results(
+                    "batch_revoke",
+                    pending_keys,
+                    self.m_store.batch_revoke(pending_keys),
+                )
+            except Exception as exc:
+                logger.error(
+                    "Layerwise revoke raised attempt=%d keys=%s error=%s",
+                    attempt + 1,
+                    pending_keys,
+                    exc,
+                )
+            else:
+                succeeded = [
+                    key for key, result in zip(pending_keys, results, strict=True) if result == 0
+                ]
+                failed = [
+                    key for key, result in zip(pending_keys, results, strict=True) if result != 0
+                ]
+                if failed:
+                    logger.error(
+                        "Layerwise revoke failed attempt=%d keys=%s results=%s",
+                        attempt + 1,
+                        pending_keys,
+                        results,
+                    )
+                if succeeded:
+                    revoked_keys.update(succeeded)
+                    if self._session_tracker is not None:
+                        self._session_tracker.revoke_put_keys(succeeded)
+                    with self._put_started_keys_lock:
+                        self._put_revoke_pending_keys.difference_update(succeeded)
+                pending_keys = failed
+                if not pending_keys:
+                    break
+            if attempt < len(retry_delays):
+                time.sleep(retry_delays[attempt])
+
+        if pending_keys:
+            logger.error("Layerwise revoke exhausted retries keys=%s", pending_keys)
+        return revoked_keys
 
     def _handle_range_request(self, req_meta: LayerRangeReqMeta) -> None:
         layer_id = req_meta.layer_id
         if self._active_put_keys is None or layer_id == 0:
             # This mutable set is scoped to one forward batch. Keep the shared
             # metadata immutable so later layers can filter failed keys safely.
-            self._active_put_keys = {row.key for row in req_meta.rows}
+            with self._put_started_keys_lock:
+                self._active_put_keys = {
+                    row.key
+                    for row in req_meta.rows
+                    if row.key in self._put_started_keys and row.key not in self._put_revoke_pending_keys
+                }
+        else:
+            with self._put_started_keys_lock:
+                self._active_put_keys.intersection_update(self._put_started_keys)
         active_rows = [row for row in req_meta.rows if row.key in self._active_put_keys]
         active_keys = [row.key for row in active_rows]
         if active_keys:
@@ -1686,14 +1759,14 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                     failed_commit_keys = [
                         key for key, result in zip(active_keys, commit_results, strict=True) if result != 0
                     ]
-                    if failed_commit_keys:
-                        self._revoke_range_keys(failed_commit_keys)
                     committed_keys = [
                         key for key, result in zip(active_keys, commit_results, strict=True) if result == 0
                     ]
                     if self._session_tracker is not None:
                         self._session_tracker.commit_put_keys(committed_keys)
-                    self._remove_started_keys(active_keys)
+                    self._remove_started_keys(committed_keys)
+                    if failed_commit_keys:
+                        self._revoke_range_keys(failed_commit_keys)
             self._active_put_keys = None
 
     def _handle_mooncake_range_save(
@@ -1764,9 +1837,14 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         request: LayerSaveTask | LayerwisePreparation | _LayerRevokeTask,
     ):
         if isinstance(request, _LayerRevokeTask):
+            with self._put_started_keys_lock:
+                self._put_revoke_queued_keys.difference_update(request.keys)
+                self._put_revoke_inflight_keys.update(request.keys)
             try:
                 self._revoke_range_keys(list(request.keys))
             finally:
+                with self._put_started_keys_lock:
+                    self._put_revoke_inflight_keys.difference_update(request.keys)
                 self.request_queue.task_done()
             return
         if isinstance(request, LayerwisePreparation):
