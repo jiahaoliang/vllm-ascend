@@ -1731,6 +1731,8 @@ class KVPoolWorker:
         """
         if not self.use_block_key_layerwise or self.kv_send_thread is None:
             return
+        if self._is_mooncake_layerwise_noop_step():
+            return
         if self.current_layer >= self.num_layers:
             return
         if layer_name:
@@ -1770,6 +1772,9 @@ class KVPoolWorker:
     def save_kv_layer(self, connector_metadata: AscendConnectorMetadata) -> None:
         if self.current_layer >= self.num_layers:
             return
+        if self._is_mooncake_layerwise_noop_step():
+            self.current_layer += 1
+            return
         assert self.sync_save_events is not None
         assert self.layer_save_finished_events is not None
         assert self.kv_send_thread is not None
@@ -1798,6 +1803,14 @@ class KVPoolWorker:
                     self.layer_save_finished_events[layer_id].clear()
 
         self.current_layer = self.current_layer + 1
+
+    def _is_mooncake_layerwise_noop_step(self) -> bool:
+        return (
+            self.backend_name == "mooncake"
+            and self._layerwise_pd_transfer_waiter is None
+            and not any(self.layer_save_tasks)
+            and not any(self.layer_load_tasks)
+        )
 
     def wait_for_save(self, connector_metadata: AscendConnectorMetadata):
         current_event = None

@@ -149,6 +149,7 @@ class TestKVPoolWorkerEarlyDispatch(unittest.TestCase):
         worker = object.__new__(KVPoolWorker)
         worker.num_layers = num_layers
         worker.use_block_key_layerwise = True
+        worker.backend_name = "memcache"
         worker.current_layer = 0
         worker._scatter_cursor = 0
         worker._early_dispatched = set()
@@ -160,6 +161,7 @@ class TestKVPoolWorkerEarlyDispatch(unittest.TestCase):
             [MagicMock(block_ranges=[MagicMock(request=MagicMock(req_id="r1"))])] if with_save_tasks else []
             for _ in range(num_layers)
         ]
+        worker.layer_load_tasks = [[] for _ in range(num_layers)]
         worker.kv_send_thread = MagicMock()
         worker.prefetch_layer_map = {}
         worker.hf_config = MagicMock()
@@ -239,6 +241,54 @@ class TestKVPoolWorkerEarlyDispatch(unittest.TestCase):
         worker.save_kv_layer(MagicMock())
         worker.kv_send_thread.add_request.assert_called_once()
         self.assertTrue(worker.layer_attn_recorded_events[0].is_set())
+
+    def test_mooncake_decode_steps_do_not_republish_reuse_save_gate(self):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
+            KVCacheStoreLayerSendingThread,
+        )
+
+        num_layers = 6
+        worker = self._make_worker(num_layers=num_layers, with_save_tasks=False)
+        worker.backend_name = "mooncake"
+        worker.layerwise_offload = True
+        worker.prefetch_layer_map = {4: 1}
+        worker.layer_load_tasks = [[] for _ in range(num_layers)]
+
+        store = MagicMock()
+        token_database = MagicMock()
+        token_database.group_block_len = {0: [16]}
+        ready = threading.Event()
+        send_thread = KVCacheStoreLayerSendingThread(
+            m_store=store,
+            token_database=token_database,
+            block_size=16,
+            tp_rank=0,
+            tp_size=1,
+            dcp_size=1,
+            put_step=1,
+            ready_event=ready,
+            num_layers=num_layers,
+            layer_save_finished_events=worker.layer_save_finished_events,
+            sync_save_events=worker.sync_save_events,
+            group_array_builders=[MagicMock()],
+            sync_attn_events=worker.sync_attn_events,
+            layer_attn_recorded_events=worker.layer_attn_recorded_events,
+        )
+        worker.kv_send_thread = send_thread
+        send_thread.start()
+        self.assertTrue(ready.wait(timeout=5))
+
+        for _ in range(2):
+            worker.current_layer = 0
+            worker._scatter_cursor = 0
+            worker._early_dispatched = set()
+            for event in worker.layer_attn_recorded_events:
+                event.clear()
+            for layer_id in range(num_layers):
+                worker.on_kv_cache_written(f"model.layers.{layer_id}.self_attn")
+                worker.save_kv_layer(MagicMock())
+                send_thread.request_queue.join()
+                send_thread.raise_if_failed()
 
     def test_key_path_keeps_raw_transfer_task_request(self):
         worker = self._make_worker()
