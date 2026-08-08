@@ -3057,13 +3057,13 @@ class TestKVPoolWorkerMooncakeLayerSessions(unittest.TestCase):
                 worker.process_layer_data([request])
 
                 self.assertIsNone(request.save_last_block_key)
-                expected_pending = set() if failure == "negative" else {"model@r1_lastblock@0"}
+                expected_pending = set() if failure == "negative" else {"model@r1_lastblock_8@0"}
                 self.assertEqual(worker._put_started_keys, set())
                 self.assertEqual(worker._put_revoke_pending_keys, expected_pending)
                 if failure == "negative":
                     worker.kv_send_thread.add_revoke_request.assert_not_called()
                 else:
-                    worker.kv_send_thread.add_revoke_request.assert_called_once_with(["model@r1_lastblock@0"])
+                    worker.kv_send_thread.add_revoke_request.assert_called_once_with(["model@r1_lastblock_8@0"])
                 worker.m_store.batch_revoke.assert_not_called()
                 self.assertEqual(len(worker.layer_save_tasks), 2)
                 for layer_tasks in worker.layer_save_tasks:
@@ -3400,10 +3400,75 @@ class TestKVPoolWorkerMooncakeLayerSessions(unittest.TestCase):
 
         self.assertEqual(
             request.load_block_keys,
-            ["model@0a@0", "model@r1_lastblock@0"],
+            ["model@0a@0", "model@r1_lastblock_32@0"],
         )
         self.assertIsNone(request.load_last_block_key)
-        self.assertEqual(request.load_keys, ["model@0a@0", "model@r1_lastblock@0"])
+        self.assertEqual(request.load_keys, ["model@0a@0", "model@r1_lastblock_32@0"])
+
+    def test_partial_steps_load_committed_snapshot_before_saving_next_version(self):
+        worker = self._make_worker()
+        worker.block_size = 16
+        available_keys = {"model@0a@0"}
+
+        def get_start(keys):
+            return [0 if key in available_keys else -1 for key in keys]
+
+        def put_start(keys, sizes):
+            return [0 if key not in available_keys else -1 for key in keys]
+
+        worker.m_store.batch_get_start.side_effect = get_start
+        worker.m_store.batch_put_start.side_effect = put_start
+        worker._mooncake_session_tracker.prepare_load_entries("r1", [("model@0a@0", 0)])
+
+        partial_prefill = ReqMeta(
+            req_id="r1",
+            token_len_chunk=16,
+            save_start_token=16,
+            save_end_token=16,
+            target_token_len=20,
+            block_ids=[10, 11],
+            block_hashes=[b"\x0a"],
+            can_save=True,
+            load_spec=LoadSpec(16, 16, True, 16),
+            partial_block_index=1,
+        )
+
+        worker.process_layer_data([partial_prefill])
+
+        first_partial_key = "model@r1_lastblock_20@0"
+        worker.m_store.batch_get_start.assert_called_once_with(["model@0a@0"])
+        worker.m_store.batch_put_start.assert_called_once_with([first_partial_key], [128])
+        self.assertEqual(worker.get_block_ids_with_load_errors(), set())
+        self.assertEqual(partial_prefill.save_last_block_key, first_partial_key)
+
+        worker._mooncake_session_tracker.commit_put_keys([first_partial_key])
+        with worker._put_started_keys_lock:
+            worker._put_started_keys.discard(first_partial_key)
+        available_keys.add(first_partial_key)
+        worker.m_store.reset_mock()
+        worker.m_store.batch_get_start.side_effect = get_start
+        worker.m_store.batch_put_start.side_effect = put_start
+
+        decode = ReqMeta(
+            req_id="r1",
+            token_len_chunk=16,
+            save_start_token=16,
+            save_end_token=16,
+            target_token_len=21,
+            block_ids=[10, 11],
+            block_hashes=[b"\x0a"],
+            can_save=True,
+            load_spec=LoadSpec(20, 20, True, 20),
+            partial_block_index=1,
+        )
+
+        worker.process_layer_data([decode])
+
+        second_partial_key = "model@r1_lastblock_21@0"
+        worker.m_store.batch_get_start.assert_called_once_with(["model@0a@0", first_partial_key])
+        worker.m_store.batch_put_start.assert_called_once_with([second_partial_key], [128])
+        self.assertEqual(worker.get_block_ids_with_load_errors(), set())
+        self.assertEqual(decode.save_last_block_key, second_partial_key)
 
     def test_put_start_shape_error_queues_revoke_and_tracks_pending_keys(self):
         worker = self._make_worker()

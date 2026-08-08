@@ -1232,6 +1232,13 @@ class KVPoolWorker:
     def _layerwise_block_tail(block_hash: BlockHash) -> str:
         return block_hash if isinstance(block_hash, str) else block_hash.hex()
 
+    def _mooncake_partial_block_key(self, request: ReqMeta, token_len: int) -> str:
+        return make_layerwise_block_key(
+            self.model_name,
+            f"{request.req_id}_lastblock_{token_len}",
+            self.head_or_tp_rank,
+        )
+
     def _record_layerwise_invalid_blocks(self, block_ids: list[int]) -> None:
         if not block_ids:
             return
@@ -1367,10 +1374,9 @@ class KVPoolWorker:
             key_slots.append((key, block_index - start_block, block_index))
 
         if request.partial_block_index is not None:
-            request.save_last_block_key = make_layerwise_block_key(
-                self.model_name,
-                f"{request.req_id}_lastblock",
-                self.head_or_tp_rank,
+            request.save_last_block_key = self._mooncake_partial_block_key(
+                request,
+                request.target_token_len,
             )
             key_slots.append(
                 (
@@ -1469,11 +1475,7 @@ class KVPoolWorker:
             if needs_last_block and 0 <= partial_block_index < len(request.block_ids):
                 current_entries.append(
                     (
-                        make_layerwise_block_key(
-                            self.model_name,
-                            f"{request.req_id}_lastblock",
-                            self.head_or_tp_rank,
-                        ),
+                        self._mooncake_partial_block_key(request, cached_tokens),
                         partial_block_index,
                     )
                 )

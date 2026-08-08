@@ -348,10 +348,10 @@ class TestKVPoolScheduler(unittest.TestCase):
 
 
 class TestKVPoolSchedulerBuildMeta(unittest.TestCase):
-    def _make_config(self, kv_role="kv_producer", block_size=16):
+    def _make_config(self, kv_role="kv_producer", block_size=16, extra_config=None):
         config = MagicMock()
         config.kv_transfer_config.kv_role = kv_role
-        config.kv_transfer_config.kv_connector_extra_config = {}
+        config.kv_transfer_config.kv_connector_extra_config = extra_config or {}
         config.kv_transfer_config.get_from_extra_config.return_value = True
         config.parallel_config.data_parallel_rank = 0
         config.parallel_config.prefill_context_parallel_size = 1
@@ -496,6 +496,7 @@ class TestKVPoolSchedulerBuildMeta(unittest.TestCase):
             req_id="r1",
             token_len=32,
             allocated_block_ids=[0, 1],
+            num_saved_tokens=32,
             token_ids=list(range(32)),
             num_prompt_tokens=16,
         )
@@ -522,6 +523,38 @@ class TestKVPoolSchedulerBuildMeta(unittest.TestCase):
         self.assertTrue(req_meta.load_spec.can_load)
         self.assertEqual(req_meta.load_spec.vllm_cached_tokens, 32)
         self.assertEqual(req_meta.load_spec.kvpool_cached_tokens, 32)
+        self.assertTrue(req_meta.can_save)
+        self.assertEqual(req_meta.partial_block_index, 2)
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+    def test_memcache_layer_reuse_keeps_existing_partial_save_policy(self, mock_client_cls):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import RequestTracker
+
+        scheduler = KVPoolScheduler(
+            self._make_config(extra_config={"backend": "memcache"}),
+            use_layerwise=False,
+        )
+        scheduler.layerwise_offload = True
+        tracker = RequestTracker(
+            req_id="r1",
+            token_len=33,
+            allocated_block_ids=[0, 1, 2],
+            num_saved_tokens=32,
+            token_ids=list(range(33)),
+            num_prompt_tokens=16,
+        )
+
+        req_meta = scheduler._build_req_meta(
+            tracker,
+            [b"h0", b"h1"],
+            LoadSpec(32, 32, True, 32),
+            list(range(16)),
+            False,
+        )
+
+        self.assertIsNotNone(req_meta)
+        self.assertFalse(req_meta.can_save)
+        self.assertIsNone(req_meta.partial_block_index)
 
 
 class TestLookupKeyClient(unittest.TestCase):

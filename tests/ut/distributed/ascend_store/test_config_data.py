@@ -663,6 +663,27 @@ class TestReqMeta(unittest.TestCase):
         self.assertIsNotNone(meta)
         self.assertEqual(meta.token_len_chunk, 16)
 
+    def test_from_request_tracker_force_skip_ignores_partial_save_capability(self):
+        tracker = RequestTracker(
+            req_id="r1",
+            token_len=20,
+            allocated_block_ids=[0, 1],
+            num_saved_tokens=16,
+        )
+
+        meta = ReqMeta.from_request_tracker(
+            tracker,
+            cache_transfer_granularity=16,
+            load_spec=LoadSpec(16, 16, True, 16),
+            skip_save=True,
+            block_hashes=[b"h0"],
+            save_partial_block=True,
+        )
+
+        self.assertIsNotNone(meta)
+        self.assertFalse(meta.can_save)
+        self.assertIsNone(meta.partial_block_index)
+
     def test_from_request_tracker_no_discard(self):
         tracker = RequestTracker(
             req_id="r1",
