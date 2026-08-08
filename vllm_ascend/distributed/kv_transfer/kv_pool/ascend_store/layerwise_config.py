@@ -3,6 +3,10 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
+    is_kv_save_role,
+)
+
 _EXTRA_CONFIG_KEY_NUM_SHARED_BUFFERS = "layerwise_num_shared_buffers"
 _EXTRA_CONFIG_KEY_PREFETCH_LAYERS = "layerwise_prefetch_layers"
 _EXTRA_CONFIG_KEY_INDEPENDENT_LAYERS = "layerwise_independent_layers"
@@ -62,8 +66,22 @@ def get_gva_layerwise_config(kv_transfer_config: Any) -> dict[str, Any] | None:
             continue
         extra_config = connector_config.get("kv_connector_extra_config") or {}
         backend = str(extra_config.get("backend", "mooncake")).lower()
-        if backend == "memcache" and extra_config.get("use_layerwise", False):
-            return extra_config
+        if backend not in ("memcache", "mooncake") or not extra_config.get("use_layerwise", False):
+            continue
+        if (
+            backend == "mooncake"
+            and extra_config.get(_EXTRA_CONFIG_KEY_NUM_SHARED_BUFFERS) is not None
+            and not is_kv_save_role(
+                getattr(kv_transfer_config, "kv_role", ""),
+                bool(extra_config.get("consumer_is_to_put", False)),
+            )
+        ):
+            raise ValueError(
+                "Mooncake layerwise KV cache buffer reuse requires a save-capable "
+                "role; remove layerwise_num_shared_buffers or use kv_producer, "
+                "kv_both, or kv_consumer with consumer_is_to_put=true."
+            )
+        return extra_config
     return None
 
 

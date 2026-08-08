@@ -67,7 +67,7 @@ def test_prefetch_default_is_bounded_and_can_be_overridden():
     assert get_layerwise_num_prefetch_layers(6, {"layerwise_prefetch_layers": 3}) == 3
 
 
-def test_gva_config_is_scoped_to_memcache_layerwise_connector():
+def test_gva_config_keeps_memcache_multi_connector_behavior():
     ascend_store_config = {
         "backend": "memcache",
         "use_layerwise": True,
@@ -88,13 +88,108 @@ def test_gva_config_is_scoped_to_memcache_layerwise_connector():
             ]
         },
     )
-    unsupported = SimpleNamespace(
+    assert get_gva_layerwise_config(multi_config) is ascend_store_config
+
+
+@pytest.mark.parametrize(
+    ("kv_role", "consumer_is_to_put"),
+    [("kv_producer", False), ("kv_both", False), ("kv_consumer", True)],
+)
+def test_gva_config_allows_mooncake_save_capable_roles(kv_role, consumer_is_to_put):
+    extra_config = {
+        "backend": "mooncake",
+        "use_layerwise": True,
+        "layerwise_num_shared_buffers": 3,
+    }
+    if consumer_is_to_put:
+        extra_config["consumer_is_to_put"] = True
+    config = SimpleNamespace(
         kv_connector="AscendStoreConnector",
-        kv_connector_extra_config={"backend": "mooncake", "use_layerwise": True},
+        kv_role=kv_role,
+        kv_connector_extra_config=extra_config,
     )
 
-    assert get_gva_layerwise_config(multi_config) is ascend_store_config
-    assert get_gva_layerwise_config(unsupported) is None
+    assert get_gva_layerwise_config(config) is extra_config
+
+
+def test_gva_config_rejects_mooncake_pure_consumer_reuse():
+    config = SimpleNamespace(
+        kv_connector="AscendStoreConnector",
+        kv_role="kv_consumer",
+        kv_connector_extra_config={
+            "backend": "mooncake",
+            "use_layerwise": True,
+            "layerwise_num_shared_buffers": 3,
+        },
+    )
+
+    with pytest.raises(ValueError, match="save-capable"):
+        get_gva_layerwise_config(config)
+
+
+@pytest.mark.parametrize(
+    "extra_config",
+    [
+        {"backend": "mooncake", "use_layerwise": True},
+        {
+            "backend": "mooncake",
+            "use_layerwise": True,
+            "layerwise_num_shared_buffers": None,
+        },
+    ],
+)
+def test_gva_config_keeps_mooncake_pure_consumer_default_without_reuse(extra_config):
+    config = SimpleNamespace(
+        kv_connector="AscendStoreConnector",
+        kv_role="kv_consumer",
+        kv_connector_extra_config=extra_config,
+    )
+
+    assert get_gva_layerwise_config(config) is extra_config
+    assert get_layerwise_config(27, extra_config).has_layer_reuse is False
+
+
+def test_gva_config_allows_single_mooncake_multi_connector_child():
+    mooncake_config = {
+        "backend": "mooncake",
+        "use_layerwise": True,
+        "layerwise_num_shared_buffers": 3,
+    }
+    config = SimpleNamespace(
+        kv_connector="MultiConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={
+            "connectors": [
+                {
+                    "kv_connector": "OtherConnector",
+                    "kv_connector_extra_config": {"use_layerwise": True},
+                },
+                {
+                    "kv_connector": "AscendStoreConnector",
+                    "kv_connector_extra_config": mooncake_config,
+                },
+            ]
+        },
+    )
+
+    assert get_gva_layerwise_config(config) is mooncake_config
+
+
+@pytest.mark.parametrize(
+    "extra_config",
+    [
+        {"backend": "mooncake", "use_layerwise": False},
+        {"backend": "yuanrong", "use_layerwise": True},
+    ],
+)
+def test_gva_config_rejects_disabled_or_unsupported_backend(extra_config):
+    config = SimpleNamespace(
+        kv_connector="AscendStoreConnector",
+        kv_role="kv_producer",
+        kv_connector_extra_config=extra_config,
+    )
+
+    assert get_gva_layerwise_config(config) is None
 
 
 def test_shared_layers_reload_full_prefix_but_independent_layers_do_not():

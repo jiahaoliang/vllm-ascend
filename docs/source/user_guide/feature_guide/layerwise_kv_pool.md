@@ -109,7 +109,7 @@ based on their failure-handling requirements.
 | `use_layerwise` | `false` | Enable layer-by-layer KV save/load. Block-key layerwise with Mooncake or memcache requires TP-only topology. |
 | `backend` | `"mooncake"` | Storage backend. Layerwise supports `"memcache"` and `"mooncake"`. |
 | `mooncake_rpc_port` | `"0"` | RPC port for the scheduler↔worker lookup service. Use `"0"` to auto-assign, or a unique port per instance. |
-| `layerwise_num_shared_buffers` | Number of model layers | Number of KV tensor slots shared round-robin by non-independent layers. Set this below the reusable layer count to enable layer reuse. |
+| `layerwise_num_shared_buffers` | Number of model layers | Number of KV tensor slots shared round-robin by non-independent layers. Set this below the reusable layer count to enable layer reuse. Mooncake compute-side reuse currently requires `kv_producer`, `kv_both`, or `kv_consumer` with `consumer_is_to_put=true`. |
 | `layerwise_independent_layers` | First and last layer | Comma-separated layer indices that retain dedicated KV buffers. Negative indices are accepted; use `all` to disable reuse explicitly. |
 | `layerwise_prefetch_layers` | `min(layerwise_num_shared_buffers, 8)` | Number of layer loads/gates to submit ahead of the compute frontier. |
 | `layerwise_max_transfer_blocks` | `0` (unlimited) | Memcache flat-GVA only: maximum KV blocks per `batch_copy` transfer. Does not split Mooncake ranged calls. |
@@ -254,6 +254,14 @@ the previous slot owner to finish saving before reusing its memory. MTP or
 speculative-decoding cache layers are included in the layer count; with the
 default independent-layer policy, the last extra layer receives a dedicated
 slot.
+
+The same compute-side reuse is available with `backend: "mooncake"` for
+save-capable roles: `kv_producer`, `kv_both`, and `kv_consumer` with
+`consumer_is_to_put: true`. A pure `kv_consumer` must omit
+`layerwise_num_shared_buffers` (or set it to `null`) in this version; a non-null
+value fails at startup because the pure-consumer slot-release path is not yet
+implemented. Omitting the option keeps the existing one-buffer-per-layer
+default while preserving ordinary Mooncake layerwise transfer.
 
 ### Prefetch Depth
 
