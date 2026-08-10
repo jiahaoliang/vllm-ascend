@@ -2218,6 +2218,37 @@ class TestKVCacheStoreLayerRecvingThread(unittest.TestCase):
         self.assertEqual(invalid_block_ids, {4})
         self.assertFalse(load_abort_event.is_set())
 
+    def test_distinct_shared_layouts_keep_independent_active_rows(self):
+        thread, store, invalid_block_ids, _, load_abort_event = self._make_thread()
+        store.copy_get_results = [[96], [96] * 5]
+
+        self._run_task(
+            thread,
+            self._make_load_task(
+                thread,
+                layer_id=0,
+                block_ids=[4],
+                block_keys=["key-tail"],
+            ),
+        )
+        self._run_task(
+            thread,
+            self._make_load_task(
+                thread,
+                layer_id=1,
+                block_ids=[0, 1, 2, 3, 4],
+                block_keys=[f"key-{index}" for index in range(5)],
+            ),
+        )
+
+        self.assertEqual(store.copy_get_calls[0][0], ["key-tail"])
+        self.assertEqual(
+            store.copy_get_calls[1][0],
+            ["key-0", "key-1", "key-2", "key-3", "key-4"],
+        )
+        self.assertEqual(invalid_block_ids, set())
+        self.assertFalse(load_abort_event.is_set())
+
     def test_range_debug_records_physical_load_layers(self):
         thread, store, invalid_block_ids, _, _ = self._make_thread()
         store.copy_get_results = [[160, 160], [128, 128]]
@@ -2388,7 +2419,10 @@ class TestKVCacheStoreLayerRecvingThread(unittest.TestCase):
         self.assertTrue(thread.layer_load_finished_events[0].is_set())
         self.assertTrue(get_event.is_set())
         self.assertEqual(task_done.call_count, 1)
-        self.assertEqual(thread._active_load_indices, set())
+        self.assertEqual(
+            thread._inactive_load_rows,
+            {("r1", 3, "key-3"), ("r1", 4, "key-4")},
+        )
 
     def test_exception_fallback_marks_full_and_partial_blocks(self):
         for include_full_block in (False, True):

@@ -41,6 +41,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
     LayerTransferTask,
     LayerwisePreparation,
     ReqMeta,
+    SharedBlockData,
     get_cache_family_granularity,
     infer_cache_family_ratio,
     infer_group_cache_families,
@@ -352,6 +353,7 @@ class KVPoolWorker:
         # the set of layers already dispatched by on_kv_cache_written.
         self._scatter_cursor = 0
         self._early_dispatched: set[int] = set()
+        self._layerwise_step_requires_save_gates = False
         self._put_started_keys: set[str] = set()
         self._put_revoke_pending_keys: set[str] = set()
         self._put_started_keys_lock = threading.Lock()
@@ -930,6 +932,7 @@ class KVPoolWorker:
     def start_load_kv(self, metadata: AscendConnectorMetadata):
         self.current_layer = 0
         if self.use_layerwise:
+            self._layerwise_step_requires_save_gates = any(request.can_save is True for request in metadata.requests)
             self.next_layer_to_submit = 0
             self._scatter_cursor = 0
             self._early_dispatched = set()
@@ -1210,23 +1213,18 @@ class KVPoolWorker:
                         task.shared_block_data = shared
 
     def _build_shared_load_data(self) -> None:
-        """Attach one Mooncake shared block description to every group layer."""
+        """Share Mooncake block descriptions across matching layer layouts."""
         if not isinstance(self.kv_recv_thread, KVCacheStoreLayerRecvingThread):
             return
-        for group_id in range(self.num_kv_cache_groups):
-            first_task = next(
-                (task for layer_tasks in self.layer_load_tasks for task in layer_tasks if task.group_id == group_id),
-                None,
-            )
-            if first_task is None:
-                continue
-            shared = self.kv_recv_thread.build_shared_data(first_task)
-            if shared is None:
-                continue
-            for layer_tasks in self.layer_load_tasks:
-                for task in layer_tasks:
-                    if task.group_id == group_id:
-                        task.shared_block_data = shared
+        shared_by_layout: dict[tuple[int, bool], SharedBlockData | None] = {}
+        for layer_tasks in self.layer_load_tasks:
+            for task in layer_tasks:
+                layout = (task.group_id, task.uses_hbm_tail)
+                if layout not in shared_by_layout:
+                    shared_by_layout[layout] = self.kv_recv_thread.build_shared_data(task)
+                shared = shared_by_layout[layout]
+                if shared is not None:
+                    task.shared_block_data = shared
 
     @staticmethod
     def _layerwise_block_tail(block_hash: BlockHash) -> str:
@@ -1238,6 +1236,24 @@ class KVPoolWorker:
             f"{request.req_id}_lastblock_{token_len}",
             self.head_or_tp_rank,
         )
+
+    def _mooncake_partial_load_key(
+        self,
+        request: ReqMeta,
+        block_index: int,
+        cached_tokens: int,
+    ) -> str:
+        load_spec = request.load_spec
+        if load_spec is not None and load_spec.vllm_cached_tokens == 0 and block_index < len(request.block_hashes):
+            # Prefill and Decode request IDs are process-local. Initial PD
+            # loads must use the content-addressed key; request snapshots are
+            # reserved for later increments of the same engine-side request.
+            return make_layerwise_block_key(
+                self.model_name,
+                self._layerwise_block_tail(request.block_hashes[block_index]),
+                self.head_or_tp_rank,
+            )
+        return self._mooncake_partial_block_key(request, cached_tokens)
 
     def _record_layerwise_invalid_blocks(self, block_ids: list[int]) -> None:
         if not block_ids:
@@ -1323,13 +1339,14 @@ class KVPoolWorker:
     def _finish_current_mooncake_load_sessions(self) -> None:
         if self._layer_load_aborted.is_set():
             req_ids = self._current_mooncake_request_ids.copy()
-            release_requests = self._release_mooncake_requests_for_retry
         else:
             req_ids = self._current_mooncake_last_chunk_req_ids.copy()
-            release_requests = self._release_mooncake_requests_terminal
         if not req_ids:
             return
-        release_requests(req_ids)
+        # is_last_chunk ends prefill chunking, not the request. Close this
+        # step's get sessions while retaining committed snapshots for decode;
+        # get_finished() removes them when the request actually terminates.
+        self._release_mooncake_requests_for_retry(req_ids)
         self._current_mooncake_request_ids.difference_update(req_ids)
         self._current_mooncake_last_chunk_req_ids.difference_update(req_ids)
 
@@ -1475,7 +1492,11 @@ class KVPoolWorker:
             if needs_last_block and 0 <= partial_block_index < len(request.block_ids):
                 current_entries.append(
                     (
-                        self._mooncake_partial_block_key(request, cached_tokens),
+                        self._mooncake_partial_load_key(
+                            request,
+                            partial_block_index,
+                            cached_tokens,
+                        ),
                         partial_block_index,
                     )
                 )
@@ -1794,6 +1815,10 @@ class KVPoolWorker:
             while not self.layer_save_finished_events[self.num_layers - 1].wait(timeout=10):
                 send_thread.raise_if_failed()
                 logger.info("Layerwise %d save not done, keep waiting", self.current_layer)
+            if self.backend_name == "mooncake" and self.layerwise_offload:
+                assert self.kv_recv_thread is not None
+                self.kv_recv_thread.request_queue.join()
+                self.kv_recv_thread.raise_if_failed()
             # A reused buffer's load task owns its save gate and clears it
             # after observing the signal. Clearing that gate here can race
             # with the asynchronous receive thread and lose the wake-up.
@@ -1810,6 +1835,7 @@ class KVPoolWorker:
         return (
             self.backend_name == "mooncake"
             and self._layerwise_pd_transfer_waiter is None
+            and not self._layerwise_step_requires_save_gates
             and not any(self.layer_save_tasks)
             and not any(self.layer_load_tasks)
         )

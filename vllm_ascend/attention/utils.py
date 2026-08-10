@@ -382,11 +382,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             group_key_idx=self.group_key_idx,
             group_key_cache_idx=self.group_key_cache_idx,
             req_ids_tensor=_slice_reqs(self.req_ids_tensor),
-            token_to_req=(
-                self.token_to_req[:num_actual_tokens]
-                if self.token_to_req is not None
-                else None
-            ),
+            token_to_req=(self.token_to_req[:num_actual_tokens] if self.token_to_req is not None else None),
         )
 
 
@@ -506,11 +502,13 @@ def split_decodes_and_prefills(
     return (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens)
 
 
-def wait_for_kv_layer_from_connector(layer_name: str):
+def wait_for_kv_layer_from_connector(layer_name: str, *, is_decode: bool = False):
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
         return
 
     connector = get_kv_transfer_group()
+    if is_decode and not getattr(connector, "requires_decode_layer_load", False):
+        return
 
     forward_context: ForwardContext = get_forward_context()
     attn_metadata = forward_context.attn_metadata

@@ -2003,7 +2003,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 group_id=0,
             )
         self._load_abort_event = load_abort_event or threading.Event()
-        self._active_load_indices: set[int] | None = None
+        self._inactive_load_rows: set[tuple[str, int, str]] = set()
         self.group_builders: list[LayerBatchBuilder] | None = group_builders
         if group_builders is not None:
             self.layer_batch_builder = group_builders[0]
@@ -2079,16 +2079,13 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         shared: SharedBlockData,
     ) -> None:
         layer_id = req_meta.layer_id
-        # Every layer is built from the same SharedBlockData row order, so a
-        # row index identifies one key/local-block destination across layers.
-        if self._active_load_indices is None or layer_id == 0:
-            self._active_load_indices = set(range(len(req_meta.rows)))
-
-        assert self._active_load_indices is not None
+        if layer_id == 0:
+            self._inactive_load_rows.clear()
+        row_identities = [(row.req_id, row.block_id, row.key) for row in req_meta.rows]
         active_indices = [
             index
-            for index in range(len(req_meta.rows))
-            if not self._load_abort_event.is_set() and index in self._active_load_indices
+            for index, row_identity in enumerate(row_identities)
+            if not self._load_abort_event.is_set() and row_identity not in self._inactive_load_rows
         ]
         if active_indices:
             self._stagger_h2d_submit(layer_id)
@@ -2121,7 +2118,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                         exc,
                     )
                     self._mark_invalid_range_indices(req_meta, request_indices)
-                    self._active_load_indices.difference_update(request_indices)
+                    self._inactive_load_rows.update(row_identities[index] for index in request_indices)
                     continue
                 results_by_index.update(zip(request_indices, request_results, strict=True))
 
@@ -2139,13 +2136,13 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 self._mark_invalid_range_indices(req_meta, failed_indices)
                 # A negative ranged result belongs to one destination row; it
                 # does not by itself invalidate every row sharing the key.
-                self._active_load_indices.difference_update(failed_indices)
+                self._inactive_load_rows.update(row_identities[index] for index in failed_indices)
 
         if layer_id == self.final_layer_id:
             for req_id, is_last_chunk in zip(req_meta.req_ids, shared.is_last_chunks, strict=True):
                 if is_last_chunk:
                     self.set_finished_request(req_id)
-            self._active_load_indices = None
+            self._inactive_load_rows.clear()
 
     def _finish_layer_load_task(
         self,
@@ -2289,8 +2286,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             logger.error("Layerwise load handler failed layer=%d error=%s", layer_id, exc)
             self._mark_invalid_transfer_task_blocks(data.transfer_tasks)
             if use_key_major_ranges:
-                if self._active_load_indices is not None:
-                    self._active_load_indices.clear()
+                self._inactive_load_rows.clear()
                 # KVPoolWorker owns the exactly-once session cleanup. Waking
                 # the layer waiter here only reports that the failed read has
                 # drained; invalid-block state prevents consuming it as a hit.

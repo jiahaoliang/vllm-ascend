@@ -167,6 +167,7 @@ class TestKVPoolWorkerEarlyDispatch(unittest.TestCase):
         worker.hf_config = MagicMock()
         worker.hf_config.num_hidden_layers = num_layers
         worker._layerwise_pd_transfer_waiter = None
+        worker._layerwise_step_requires_save_gates = False
         worker.layerwise_offload = False
         return worker
 
@@ -289,6 +290,116 @@ class TestKVPoolWorkerEarlyDispatch(unittest.TestCase):
                 worker.save_kv_layer(MagicMock())
                 send_thread.request_queue.join()
                 send_thread.raise_if_failed()
+
+    def test_mooncake_non_owner_publishes_reuse_save_gate_across_chunks(self):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
+            KVCacheStoreLayerRecvingThread,
+            KVCacheStoreLayerSendingThread,
+        )
+
+        num_layers = 6
+        worker = self._make_worker(num_layers=num_layers, with_save_tasks=False)
+        worker.backend_name = "mooncake"
+        worker.use_layerwise = True
+        worker.layerwise_offload = True
+        worker.kv_role = "kv_producer"
+        worker.consumer_is_to_put = False
+        worker.tp_rank = 1
+        worker.tp_size = 2
+        worker.put_step = 2
+        self.assertFalse(worker._is_layerwise_save_owner())
+        worker.prefetch_layer_map = {4: 1}
+        worker.num_prefetch_layers = 1
+        worker.next_layer_to_submit = 0
+        worker.layer_load_finished_events = [threading.Event() for _ in range(num_layers)]
+        worker._layer_load_preparation = None
+        worker._invalid_block_ids = set()
+        worker._invalid_block_ids_lock = threading.Lock()
+        worker._layer_load_aborted = threading.Event()
+        worker._current_mooncake_request_ids = set()
+        worker._current_mooncake_last_chunk_req_ids = set()
+        worker.process_layer_data = MagicMock()
+
+        store = MagicMock()
+        token_database = MagicMock()
+        token_database.group_block_len = {0: [16]}
+        send_ready = threading.Event()
+        send_thread = KVCacheStoreLayerSendingThread(
+            m_store=store,
+            token_database=token_database,
+            block_size=16,
+            tp_rank=worker.tp_rank,
+            tp_size=worker.tp_size,
+            dcp_size=1,
+            put_step=worker.put_step,
+            ready_event=send_ready,
+            num_layers=num_layers,
+            layer_save_finished_events=worker.layer_save_finished_events,
+            sync_save_events=worker.sync_save_events,
+            group_array_builders=[MagicMock()],
+            sync_attn_events=worker.sync_attn_events,
+            layer_attn_recorded_events=worker.layer_attn_recorded_events,
+        )
+        recv_ready = threading.Event()
+        recv_thread = KVCacheStoreLayerRecvingThread(
+            m_store=store,
+            token_database=token_database,
+            block_size=16,
+            tp_rank=worker.tp_rank,
+            tp_size=worker.tp_size,
+            dcp_size=1,
+            ready_event=recv_ready,
+            get_event=threading.Event(),
+            layer_load_finished_events=worker.layer_load_finished_events,
+            layer_save_finished_events=worker.layer_save_finished_events,
+            num_layers=num_layers,
+            group_array_builders=[MagicMock()],
+            invalid_block_ids=worker._invalid_block_ids,
+            invalid_block_ids_lock=worker._invalid_block_ids_lock,
+            load_abort_event=worker._layer_load_aborted,
+        )
+        worker.kv_send_thread = send_thread
+        worker.kv_recv_thread = recv_thread
+        send_thread.start()
+        recv_thread.start()
+        self.assertTrue(send_ready.wait(timeout=5))
+        self.assertTrue(recv_ready.wait(timeout=5))
+
+        completed_chunks = []
+        for chunk_index in range(2):
+            request = ReqMeta(
+                req_id="r1",
+                token_len_chunk=(chunk_index + 1) * 16,
+                block_ids=list(range(chunk_index + 1)),
+                block_hashes=[f"h{index}" for index in range(chunk_index + 1)],
+                can_save=True,
+                is_last_chunk=chunk_index == 1,
+            )
+            metadata = AscendConnectorMetadata(set(), set())
+            metadata.add_request(request)
+            worker.start_load_kv(metadata)
+
+            for layer_id in range(4):
+                worker.wait_for_layer_load()
+                worker.on_kv_cache_written(f"model.layers.{layer_id}.self_attn")
+                worker.save_kv_layer(metadata)
+
+            completed = worker.layer_load_finished_events[4].wait(timeout=0.5)
+            completed_chunks.append(completed)
+            if not completed:
+                worker.layer_save_finished_events[1].set()
+
+            for layer_id in range(4, num_layers):
+                worker.wait_for_layer_load()
+                worker.on_kv_cache_written(f"model.layers.{layer_id}.self_attn")
+                worker.save_kv_layer(metadata)
+
+            send_thread.request_queue.join()
+            recv_thread.request_queue.join()
+            send_thread.raise_if_failed()
+            recv_thread.raise_if_failed()
+
+        self.assertEqual(completed_chunks, [True, True])
 
     def test_key_path_keeps_raw_transfer_task_request(self):
         worker = self._make_worker()
@@ -1939,6 +2050,51 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
             worker.layer_load_tasks[2][0].block_ranges,
         )
 
+    def test_mooncake_load_metadata_is_shared_per_hbm_tail_layout(self):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
+            KVCacheStoreLayerRecvingThread,
+        )
+
+        worker = self._make_worker()
+        worker.num_layers = 3
+        worker.kv_recv_thread = MagicMock(spec=KVCacheStoreLayerRecvingThread)
+        request = ReqMeta(
+            req_id="r1",
+            block_ids=[10, 11],
+            load_block_keys=["full", "tail"],
+        )
+        tail_ranges = [LayerBlockRange(request, 1, 2)]
+        full_ranges = [LayerBlockRange(request, 0, 2)]
+        tail_0 = LayerTransferTask(
+            layer_id=0,
+            block_ranges=tail_ranges,
+            uses_hbm_tail=True,
+            use_key_major_ranges=True,
+        )
+        full_1 = LayerTransferTask(
+            layer_id=1,
+            block_ranges=full_ranges,
+            uses_hbm_tail=False,
+            use_key_major_ranges=True,
+        )
+        tail_2 = LayerTransferTask(
+            layer_id=2,
+            block_ranges=tail_ranges,
+            uses_hbm_tail=True,
+            use_key_major_ranges=True,
+        )
+        worker.layer_load_tasks = [[tail_0], [full_1], [tail_2]]
+        shared_by_layout = {False: object(), True: object()}
+        worker.kv_recv_thread.build_shared_data.side_effect = lambda task: shared_by_layout[task.uses_hbm_tail]
+
+        worker._build_shared_load_data()
+
+        self.assertEqual(worker.kv_recv_thread.build_shared_data.call_count, 2)
+        self.assertIs(tail_0.shared_block_data, shared_by_layout[True])
+        self.assertIs(tail_2.shared_block_data, shared_by_layout[True])
+        self.assertIs(full_1.shared_block_data, shared_by_layout[False])
+        self.assertIsNot(full_1.shared_block_data, tail_0.shared_block_data)
+
     def test_layer_reuse_slices_each_request_by_its_hbm_prefix(self):
         worker = self._make_worker()
         worker.layerwise_offload = True
@@ -2025,6 +2181,35 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
         self.assertTrue(worker.layer_save_finished_events[0].is_set())
         self.assertFalse(worker.layer_save_finished_events[1].is_set())
         self.assertFalse(worker.layer_save_finished_events[2].is_set())
+
+    def test_mooncake_reuse_final_save_drains_pending_layer_loads(self):
+        class ReceiveQueue:
+            def __init__(self):
+                self.drained = False
+
+            def join(self):
+                self.drained = True
+
+        worker = self._make_worker()
+        worker.num_layers = 3
+        worker.current_layer = 2
+        worker.backend_name = "mooncake"
+        worker.layerwise_offload = True
+        worker.prefetch_layer_map = {2: 0}
+        worker.layer_save_tasks = [[MagicMock()] for _ in range(3)]
+        worker.sync_save_events = [MagicMock() for _ in range(3)]
+        worker.sync_attn_events = [MagicMock() for _ in range(3)]
+        worker.layer_attn_recorded_events = [threading.Event() for _ in range(3)]
+        worker.layer_save_finished_events = [threading.Event() for _ in range(3)]
+        worker.layer_save_finished_events[2].set()
+        worker.kv_send_thread = MagicMock()
+        worker.kv_recv_thread = MagicMock()
+        receive_queue = ReceiveQueue()
+        worker.kv_recv_thread.request_queue = receive_queue
+
+        worker.save_kv_layer(MagicMock())
+
+        self.assertTrue(receive_queue.drained)
 
     def test_empty_layer_save_defers_pd_completion_to_sending_thread(self):
         worker = self._make_worker()
@@ -2816,6 +3001,7 @@ class TestKVPoolWorkerMooncakeLayerSessions(unittest.TestCase):
         worker._early_dispatched = set()
         worker._scatter_cursor = 0
         worker._layerwise_pd_transfer_waiter = None
+        worker._layerwise_step_requires_save_gates = False
         worker._put_started_keys = set()
         worker._put_revoke_pending_keys = set()
         worker._put_started_keys_lock = threading.Lock()
@@ -3232,8 +3418,10 @@ class TestKVPoolWorkerMooncakeLayerSessions(unittest.TestCase):
             [],
         )
 
-    def test_final_layer_completion_closes_load_sessions(self):
+    def test_last_prefill_chunk_preserves_snapshot_until_request_finished(self):
         worker = self._make_worker()
+        worker.use_memcache_gva_layerwise = False
+        worker.m_store.batch_get_end.return_value = 0
         worker.current_layer = 1
         worker.layer_load_tasks = [[], [MagicMock()]]
         worker.layer_load_finished_events = [MagicMock(), MagicMock()]
@@ -3247,6 +3435,20 @@ class TestKVPoolWorkerMooncakeLayerSessions(unittest.TestCase):
         worker.wait_for_layer_load()
 
         worker.m_store.batch_get_end.assert_called_once_with(["key-1"])
+        self.assertEqual(
+            worker._mooncake_session_tracker.prepare_load_entries("r1", []),
+            [("key-1", 0)],
+        )
+
+        worker.kv_send_thread = None
+        worker.kv_recv_thread = None
+        worker.load_async = False
+        worker.get_finished({"r1"}, AscendConnectorMetadata(set(), set()))
+
+        self.assertEqual(
+            worker._mooncake_session_tracker.prepare_load_entries("r1", []),
+            [],
+        )
 
     def test_receiver_abort_closes_load_sessions_after_layer_completion(self):
         worker = self._make_worker()
@@ -3404,6 +3606,25 @@ class TestKVPoolWorkerMooncakeLayerSessions(unittest.TestCase):
         )
         self.assertIsNone(request.load_last_block_key)
         self.assertEqual(request.load_keys, ["model@0a@0", "model@r1_lastblock_32@0"])
+
+    def test_no_reuse_consumer_uses_block_hash_for_partial_range(self):
+        worker = self._make_worker()
+        worker.kv_role = "kv_consumer"
+        worker.m_store.batch_get_start.return_value = [0, 0]
+        request = ReqMeta(
+            req_id="decode-request",
+            token_len_chunk=32,
+            block_ids=[10, 11],
+            block_hashes=[b"\x0a", b"\x0b"],
+            load_spec=LoadSpec(0, 31, True, 31),
+        )
+
+        worker._prepare_mooncake_layerwise_sessions([request])
+
+        expected_keys = ["model@0a@0", "model@0b@0"]
+        worker.m_store.batch_get_start.assert_called_once_with(expected_keys)
+        self.assertEqual(request.load_block_keys, expected_keys)
+        self.assertEqual(request.load_keys, expected_keys)
 
     def test_partial_steps_load_committed_snapshot_before_saving_next_version(self):
         worker = self._make_worker()

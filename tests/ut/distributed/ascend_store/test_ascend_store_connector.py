@@ -419,6 +419,64 @@ class TestAscendStoreConnectorLayerwise(unittest.TestCase):
     def test_requires_piecewise_for_cudagraph_missing(self):
         self.assertFalse(self.connector_mod.AscendStoreConnector.requires_piecewise_for_cudagraph({}))
 
+    def test_mooncake_reuse_opts_into_decode_layer_loads(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+
+        with (
+            patch.object(self.connector_mod, "KVPoolWorker") as mock_worker_cls,
+            patch.object(self.connector_mod, "LookupKeyServer") as _mock_lookup_cls,
+        ):
+            config = MagicMock()
+            config.kv_transfer_config.kv_role = "kv_both"
+            config.kv_transfer_config.kv_connector = "AscendStoreConnector"
+            config.kv_transfer_config.kv_connector_extra_config = {
+                "backend": "mooncake",
+                "use_layerwise": True,
+                "layerwise_num_shared_buffers": 3,
+            }
+            config.parallel_config.rank = 0
+            config.parallel_config.pipeline_parallel_size = 1
+            config.parallel_config.prefill_context_parallel_size = 1
+            config.parallel_config.decode_context_parallel_size = 1
+            mock_worker_cls.return_value.layerwise_offload = True
+
+            connector = self.connector_mod.AscendStoreConnector(
+                vllm_config=config,
+                role=KVConnectorRole.WORKER,
+                kv_cache_config=None,
+            )
+
+            self.assertTrue(connector.requires_decode_layer_load)
+
+    def test_memcache_reuse_does_not_opt_into_decode_layer_loads(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+
+        with (
+            patch.object(self.connector_mod, "KVPoolWorker") as mock_worker_cls,
+            patch.object(self.connector_mod, "LookupKeyServer") as _mock_lookup_cls,
+        ):
+            config = MagicMock()
+            config.kv_transfer_config.kv_role = "kv_both"
+            config.kv_transfer_config.kv_connector = "AscendStoreConnector"
+            config.kv_transfer_config.kv_connector_extra_config = {
+                "backend": "memcache",
+                "use_layerwise": True,
+                "layerwise_num_shared_buffers": 3,
+            }
+            config.parallel_config.rank = 0
+            config.parallel_config.pipeline_parallel_size = 1
+            config.parallel_config.prefill_context_parallel_size = 1
+            config.parallel_config.decode_context_parallel_size = 1
+            mock_worker_cls.return_value.layerwise_offload = True
+
+            connector = self.connector_mod.AscendStoreConnector(
+                vllm_config=config,
+                role=KVConnectorRole.WORKER,
+                kv_cache_config=None,
+            )
+
+            self.assertFalse(connector.requires_decode_layer_load)
+
     def test_wait_for_save_layerwise_returns_early(self):
         from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 

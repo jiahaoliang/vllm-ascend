@@ -2038,6 +2038,41 @@ class TestAscendMLAImpl(TestBase):
         self.assertIsNotNone(decode_res)
         self.assertIsNotNone(prefill_res)
 
+    @patch("torch.ops.vllm.maybe_all_gather_and_maybe_unpad")
+    def test_mla_preprocess_decode_requests_scoped_layer_wait(
+        self,
+        mock_maybe_all_gather_and_maybe_unpad,
+    ):
+        mock_maybe_all_gather_and_maybe_unpad.side_effect = lambda value, _: value
+        hidden_states = torch.randn(2, 1024)
+        projected_size = self.impl.q_lora_rank + self.impl.kv_lora_rank + self.impl.qk_rope_head_dim
+        self.impl.fused_qkv_a_proj = MagicMock(return_value=[torch.randn(2, projected_size)])
+        self.impl.q_a_layernorm = MagicMock(side_effect=lambda value: value)
+        self.impl.mla_preprocess_decode = MagicMock(return_value=MagicMock())
+        attn_metadata = MagicMock(num_decodes=2, num_prefills=0)
+        connector = MagicMock(requires_decode_layer_load=True)
+
+        with (
+            patch("vllm_ascend.attention.utils.has_kv_transfer_group", return_value=True),
+            patch("vllm_ascend.attention.utils.is_v1_kv_transfer_group", return_value=True),
+            patch("vllm_ascend.attention.utils.get_kv_transfer_group", return_value=connector),
+            patch(
+                "vllm_ascend.attention.utils.get_forward_context",
+                return_value=MagicMock(attn_metadata=MagicMock()),
+            ),
+        ):
+            decode_res, prefill_res = self.impl._mla_preprocess(
+                "mock_layer",
+                hidden_states,
+                MagicMock(),
+                attn_metadata,
+                need_gather_q_kv=False,
+            )
+
+        self.assertIsNotNone(decode_res)
+        self.assertIsNone(prefill_res)
+        connector.wait_for_layer_load.assert_called_once_with("mock_layer")
+
     @patch("torch_npu.npu_kv_rmsnorm_rope_cache")
     def test_exec_kv_prefill(self, mock_kv_rmsnorm_rope_cache):
         B = 2

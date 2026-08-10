@@ -111,6 +111,7 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
 
         self.kv_caches: dict[str, torch.Tensor] = {}
         self._kv_cache_events: AscendStoreKVEvents | None = None
+        self.requires_decode_layer_load = False
 
         self._current_step_has_real_forward = False
 
@@ -127,6 +128,9 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
                 kv_cache_config,
             )
             assert self.connector_worker is not None
+            self.requires_decode_layer_load = (
+                self.backend_name == "mooncake" and self.connector_worker.layerwise_offload
+            )
             if not self.use_layerwise and vllm_config.parallel_config.rank == 0:
                 self.lookup_server = LookupKeyServer(self.connector_worker, vllm_config)
 
