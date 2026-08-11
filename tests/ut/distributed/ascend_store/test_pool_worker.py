@@ -3021,6 +3021,7 @@ class TestKVPoolWorkerMooncakeLayerSessions(unittest.TestCase):
 
     def test_next_chunk_renews_prefix_and_prior_complete_keys(self):
         worker = self._make_worker()
+        worker.layerwise_offload = True
         worker.m_store.batch_put_start.return_value = [0]
         worker.m_store.batch_get_start.return_value = [0]
         first_chunk = ReqMeta(
@@ -3072,6 +3073,41 @@ class TestKVPoolWorkerMooncakeLayerSessions(unittest.TestCase):
             plans[0].full_load_ranges[0].end_block,
             2,
         )
+
+    def test_no_reuse_next_chunk_does_not_reload_prior_complete_keys(self):
+        worker = self._make_worker()
+        worker.m_store.batch_put_start.return_value = [0]
+        first_chunk = ReqMeta(
+            req_id="r1",
+            token_len_chunk=16,
+            save_start_token=0,
+            save_end_token=16,
+            block_ids=[10],
+            block_hashes=[b"\x0a"],
+            can_save=True,
+            is_last_chunk=False,
+        )
+
+        worker._prepare_mooncake_layerwise_sessions([first_chunk])
+        worker._mooncake_session_tracker.commit_put_keys(["model@0a@0"])
+
+        worker.m_store.batch_get_start.reset_mock()
+        second_chunk = ReqMeta(
+            req_id="r1",
+            token_len_chunk=32,
+            block_ids=[10, 11],
+            block_hashes=[b"\x0a", b"\x0b"],
+            can_save=False,
+            is_last_chunk=False,
+        )
+
+        worker._prepare_mooncake_layerwise_sessions([second_chunk])
+
+        worker.m_store.batch_get_start.assert_not_called()
+        self.assertEqual(second_chunk.load_block_keys, [])
+        self.assertEqual(second_chunk.load_keys, [])
+        plans = worker._build_group_batch_plans([second_chunk])
+        self.assertEqual(plans[0].full_load_ranges, [])
 
     def test_prepare_sessions_opens_all_gets_before_any_puts(self):
         worker = self._make_worker()

@@ -1501,9 +1501,16 @@ class KVPoolWorker:
                     )
                 )
 
-        load_entries = self._mooncake_session_tracker.prepare_load_entries(
-            request.req_id,
-            current_entries,
+        # Earlier chunks only need restoring after shared HBM slots overwrite
+        # them or when an explicit load requests remote recovery. With one
+        # buffer per layer and no load request, those tensors remain resident.
+        load_entries = (
+            self._mooncake_session_tracker.prepare_load_entries(
+                request.req_id,
+                current_entries,
+            )
+            if self.layerwise_offload or (load_spec is not None and load_spec.can_load)
+            else current_entries
         )
         valid_entries = [
             (key, block_index) for key, block_index in load_entries if 0 <= block_index < len(request.block_ids)
