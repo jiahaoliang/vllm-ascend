@@ -20,9 +20,6 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend im
     Backend,
     require_aligned_batch_results,
 )
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.perf_metrics import (
-    get_kvpool_perf_metrics,
-)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.range_debug import (
     emit_whole_key_event,
 )
@@ -40,15 +37,6 @@ MOONCAKE_LAYERWISE_CLIENT_METHODS = (
     "batch_get_into_multi_buffer_ranges",
     "batch_get_session_end",
 )
-
-
-def _configure_perf_metric_labels(metrics, parallel_config: ParallelConfig) -> None:
-    if not metrics.enabled:
-        return
-    metrics.configure_labels(
-        backend="mooncake",
-        global_rank=get_global_rank(parallel_config),
-    )
 
 
 @functools.lru_cache(maxsize=1)
@@ -89,8 +77,6 @@ def _ssd_setup_kwargs(config: "MooncakeStoreConfig") -> dict[str, object]:
 class MooncakeBackend(Backend):
     def __init__(self, parallel_config: ParallelConfig, lazy_init: bool = False, contribute_memory: bool = True):
         self.parallel_config = parallel_config
-        self._perf_metrics = get_kvpool_perf_metrics()
-        _configure_perf_metric_labels(self._perf_metrics, parallel_config)
         self.config = MooncakeStoreConfig.load_from_env()
         if self.config.protocol != "ascend":
             raise NotImplementedError(f"MooncakeBackend does not support protocol {self.config.protocol!r}.")
@@ -235,14 +221,10 @@ class MooncakeBackend(Backend):
         return require_aligned_batch_results(operation, keys, method(*args))
 
     def batch_put_start(self, keys: list[str], sizes: list[int]) -> list[int]:
-        with self._perf_metrics.measure(
-            "mooncake.batch_put_start", bytes_count=sum(sizes)
-        ):
-            return self._call_layerwise_batch("batch_put_session_start", keys, keys, sizes)
+        return self._call_layerwise_batch("batch_put_session_start", keys, keys, sizes)
 
     def batch_get_start(self, keys: list[str]) -> list[int]:
-        with self._perf_metrics.measure("mooncake.batch_get_start"):
-            return self._call_layerwise_batch("batch_get_session_start", keys, keys)
+        return self._call_layerwise_batch("batch_get_session_start", keys, keys)
 
     def batch_copy_put(
         self,
@@ -251,18 +233,14 @@ class MooncakeBackend(Backend):
         all_sizes: list[list[int]],
         all_dst_offsets: list[list[int]],
     ) -> list[int]:
-        with self._perf_metrics.measure(
-            "mooncake.batch_copy_put",
-            bytes_count=sum(sum(sizes) for sizes in all_sizes),
-        ):
-            return self._call_layerwise_batch(
-                "batch_put_from_multi_buffer_ranges",
-                keys,
-                keys,
-                all_buffers,
-                all_sizes,
-                all_dst_offsets,
-            )
+        return self._call_layerwise_batch(
+            "batch_put_from_multi_buffer_ranges",
+            keys,
+            keys,
+            all_buffers,
+            all_sizes,
+            all_dst_offsets,
+        )
 
     def batch_copy_get(
         self,
@@ -271,32 +249,26 @@ class MooncakeBackend(Backend):
         all_sizes: list[list[int]],
         all_src_offsets: list[list[int]],
     ) -> list[int]:
-        with self._perf_metrics.measure(
-            "mooncake.batch_copy_get",
-            bytes_count=sum(sum(sizes) for sizes in all_sizes),
-        ):
-            return self._call_layerwise_batch(
-                "batch_get_into_multi_buffer_ranges",
-                keys,
-                keys,
-                all_buffers,
-                all_sizes,
-                all_src_offsets,
-            )
+        return self._call_layerwise_batch(
+            "batch_get_into_multi_buffer_ranges",
+            keys,
+            keys,
+            all_buffers,
+            all_sizes,
+            all_src_offsets,
+        )
 
     def batch_commit(self, keys: list[str]) -> list[int]:
-        with self._perf_metrics.measure("mooncake.batch_commit"):
-            return self._call_layerwise_batch("batch_put_session_end", keys, keys)
+        return self._call_layerwise_batch("batch_put_session_end", keys, keys)
 
     def batch_revoke(self, keys: list[str]) -> list[int]:
         return self._call_layerwise_batch("batch_put_session_revoke", keys, keys)
 
     def batch_get_end(self, keys: list[str]) -> int:
-        with self._perf_metrics.measure("mooncake.batch_get_end"):
-            self.ensure_initialized()
-            if self.store is None or not callable(getattr(self.store, "batch_get_session_end", None)):
-                raise RuntimeError("Mooncake client does not support batch_get_session_end")
-            return int(self.store.batch_get_session_end(keys))
+        self.ensure_initialized()
+        if self.store is None or not callable(getattr(self.store, "batch_get_session_end", None)):
+            raise RuntimeError("Mooncake client does not support batch_get_session_end")
+        return int(self.store.batch_get_session_end(keys))
 
     def put(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
         self.ensure_initialized()
@@ -307,11 +279,7 @@ class MooncakeBackend(Backend):
                 config.preferred_segment = self.local_seg
             config.prefer_alloc_in_same_node = self.config.prefer_alloc_in_same_node
             emit_whole_key_event("put", len(keys))
-            with self._perf_metrics.measure(
-                "mooncake.whole_put",
-                bytes_count=sum(sum(key_sizes) for key_sizes in sizes),
-            ):
-                res = self.store.batch_put_from_multi_buffers(keys, addrs, sizes, config)
+            res = self.store.batch_put_from_multi_buffers(keys, addrs, sizes, config)
             failed_codes = [int(value) for value in res if value < 0]
             failed_count = len(failed_codes)
             if failed_count:
@@ -358,11 +326,7 @@ class MooncakeBackend(Backend):
         )
         try:
             emit_whole_key_event("get", len(keys))
-            with self._perf_metrics.measure(
-                "mooncake.whole_get",
-                bytes_count=sum(sum(key_sizes) for key_sizes in sizes),
-            ):
-                res = self.store.batch_get_into_multi_buffers(keys, addrs, sizes)
+            res = self.store.batch_get_into_multi_buffers(keys, addrs, sizes)
             res_list = list(res)
             failed_codes = [int(value) for value in res_list if value < 0]
             failed_count = len(failed_codes)

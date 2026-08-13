@@ -1086,7 +1086,17 @@ class NPUPlatform(Platform):
                 )
                 vllm_config.observability_config.enable_layerwise_nvtx_tracing = False
 
-        # ==================== 5. Speculative Config ====================
+        # ==================== 5. Scheduler Config ====================
+        if vllm_config.scheduler_config:
+            # Partial prefills are specific to ROCm optimization
+            if getattr(vllm_config.scheduler_config, "max_num_partial_prefills", 1) != 1:
+                logger.warning(
+                    "Parameter is optimized for incompatible platform. "
+                    "parameter=max_num_partial_prefills, action: resetting to default (1). "
+                )
+                vllm_config.scheduler_config.max_num_partial_prefills = 1
+
+        # ==================== 6. Speculative Config ====================
         if vllm_config.speculative_config:
             # Ascend automatically inherits main model quantization
             if getattr(vllm_config.speculative_config, "quantization", None) is not None:
@@ -1097,7 +1107,7 @@ class NPUPlatform(Platform):
                 )
                 vllm_config.speculative_config.quantization = None
 
-        # ==================== 6. KV Transfer Config ====================
+        # ==================== 7. KV Transfer Config ====================
         if vllm_config.kv_transfer_config:
             # Buffer size is primarily tied to NCCL (GPU) backends
             current_buffer_size = getattr(vllm_config.kv_transfer_config, "kv_buffer_size", 1e9)
@@ -1118,7 +1128,7 @@ class NPUPlatform(Platform):
                 )
                 vllm_config.kv_transfer_config.enable_permute_local_kv = False
 
-        # ==================== 7. Attention Config ====================
+        # ==================== 8. Attention Config ====================
         if vllm_config.attention_config:
             att_config = vllm_config.attention_config
 

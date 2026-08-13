@@ -35,19 +35,6 @@ def _strict_binary_env(name: str, default: str = "0") -> bool:
     return value == "1"
 
 
-def _positive_integer_env(name: str, default: str) -> int:
-    value = os.getenv(name, default)
-    try:
-        parsed = int(value)
-    except ValueError as error:
-        raise ValueError(
-            f"{name} must be a positive integer, got {value!r}"
-        ) from error
-    if parsed <= 0 or str(parsed) != value:
-        raise ValueError(f"{name} must be a positive integer, got {value!r}")
-    return parsed
-
-
 env_variables: dict[str, Callable[[], Any]] = {
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
@@ -134,14 +121,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Emit per-layer KVPool ranged transfer audit events. Default: 0 (disabled).
     # Valid values: 0 or 1. This configuration is not sensitive.
     "VLLM_ASCEND_KVPOOL_RANGE_DEBUG": lambda: _strict_binary_env("VLLM_ASCEND_KVPOOL_RANGE_DEBUG"),
-    # Emit low-overhead aggregated KVPool timings. The collector validates the
-    # positive integer interval before starting its reporter thread.
-    "VLLM_ASCEND_KVPOOL_PERF_METRICS": lambda: _strict_binary_env(
-        "VLLM_ASCEND_KVPOOL_PERF_METRICS"
-    ),
-    "VLLM_ASCEND_KVPOOL_PERF_METRICS_INTERVAL_SECONDS": lambda: _positive_integer_env(
-        "VLLM_ASCEND_KVPOOL_PERF_METRICS_INTERVAL_SECONDS", "10"
-    ),
     # Path to a non-sensitive Mooncake nightly benchmark JSON file. Default:
     # None (the opt-in benchmark is skipped). A non-empty readable file path is
     # required when the benchmark is enabled.

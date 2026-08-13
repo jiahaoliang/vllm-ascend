@@ -77,9 +77,6 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_transfer
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mooncake_session_tracker import (
     MooncakeSessionTracker,
 )
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.perf_metrics import (
-    get_kvpool_perf_metrics,
-)
 from vllm_ascend.distributed.utils import (
     get_decode_context_model_parallel_rank,
     get_decode_context_model_parallel_world_size,
@@ -335,14 +332,6 @@ class KVPoolWorker:
             self.enable_kv_events = True
 
     def _init_state_vars(self) -> None:
-        self.perf_metrics = get_kvpool_perf_metrics()
-        self.perf_metrics.configure_labels(
-            backend=self.backend_name,
-            dp_rank=self.dp_rank,
-            tp_rank=self.tp_rank,
-            kv_role=self.kv_role,
-            use_layerwise=self.use_layerwise,
-        )
         self.kv_send_thread: KVTransferThread | None = None
         self.kv_recv_thread: KVTransferThread | None = None
         self._transfer_threads_started = False
@@ -1730,28 +1719,21 @@ class KVPoolWorker:
                 self.current_layer += 1
             return
         if self.backend_name == "mooncake":
-            with self.perf_metrics.measure(
-                "critical.wait_for_layer_load", layer_id=self.current_layer
-            ):
+            is_finish = self.layer_load_finished_events[self.current_layer].wait(timeout=10)
+            if not is_finish:
+                logger.error("Layerwise %d load wait timed out; aborting the active load batch", self.current_layer)
+                self._record_timed_out_layer_load_blocks(self.current_layer)
+                self._layer_load_aborted.set()
                 is_finish = self.layer_load_finished_events[self.current_layer].wait(timeout=10)
                 if not is_finish:
-                    logger.error("Layerwise %d load wait timed out; aborting the active load batch", self.current_layer)
-                    self._record_timed_out_layer_load_blocks(self.current_layer)
-                    self._layer_load_aborted.set()
-                    is_finish = self.layer_load_finished_events[self.current_layer].wait(timeout=10)
-                    if not is_finish:
-                        raise TimeoutError(
-                            "Mooncake layerwise load did not drain after abort; "
-                            "refusing to close the in-flight get session"
-                        )
+                    raise TimeoutError(
+                        "Mooncake layerwise load did not drain after abort; refusing to close the in-flight get session"
+                    )
         else:
-            with self.perf_metrics.measure(
-                "critical.wait_for_layer_load", layer_id=self.current_layer
-            ):
-                while not self.layer_load_finished_events[self.current_layer].wait(timeout=10):
-                    self.kv_recv_thread.raise_if_failed()
-                    logger.info("Layerwise %d load not done, keep waiting", self.current_layer)
-                is_finish = True
+            while not self.layer_load_finished_events[self.current_layer].wait(timeout=10):
+                self.kv_recv_thread.raise_if_failed()
+                logger.info("Layerwise %d load not done, keep waiting", self.current_layer)
+            is_finish = True
         logger.debug(">>>>>>>>>>>>>>>>>>>> clear load layer %d", self.current_layer)
         self.layer_load_finished_events[self.current_layer].clear()
         if (
@@ -1837,16 +1819,13 @@ class KVPoolWorker:
         self.sync_attn_events[self.current_layer].record()
         self.layer_attn_recorded_events[self.current_layer].set()
         if self.current_layer == self.num_layers - 1:
-            with self.perf_metrics.measure(
-                "critical.final_layer_save_tail", layer_id=self.current_layer
-            ):
-                while not self.layer_save_finished_events[self.num_layers - 1].wait(timeout=10):
-                    send_thread.raise_if_failed()
-                    logger.info("Layerwise %d save not done, keep waiting", self.current_layer)
-                if self.backend_name == "mooncake" and self.layerwise_offload:
-                    assert self.kv_recv_thread is not None
-                    self.kv_recv_thread.request_queue.join()
-                    self.kv_recv_thread.raise_if_failed()
+            while not self.layer_save_finished_events[self.num_layers - 1].wait(timeout=10):
+                send_thread.raise_if_failed()
+                logger.info("Layerwise %d save not done, keep waiting", self.current_layer)
+            if self.backend_name == "mooncake" and self.layerwise_offload:
+                assert self.kv_recv_thread is not None
+                self.kv_recv_thread.request_queue.join()
+                self.kv_recv_thread.raise_if_failed()
             # A reused buffer's load task owns its save gate and clears it
             # after observing the signal. Clearing that gate here can race
             # with the asynchronous receive thread and lose the wake-up.
@@ -1898,8 +1877,7 @@ class KVPoolWorker:
             # vLLM expects wait_for_save() to make stores visible before the
             # request is reported as finished. Without this barrier a following
             # identical prompt can lookup before Mooncake put() has completed.
-            with self.perf_metrics.measure("critical.whole_key_save_tail"):
-                self.kv_send_thread.request_queue.join()  # type: ignore[union-attr]
+            self.kv_send_thread.request_queue.join()  # type: ignore[union-attr]
 
     def _make_sub_key_str(self, base_key, effective_rank: int) -> str:
         """Rewrite ``@head_or_tp_rank:<local>`` in base_key.to_string() to ``<effective_rank>``.

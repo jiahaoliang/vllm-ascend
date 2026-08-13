@@ -22,8 +22,7 @@ import sys
 import tempfile
 import types
 import unittest
-from contextlib import nullcontext
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 
@@ -405,28 +404,8 @@ class TestMooncakeBackendMethods(unittest.TestCase):
             backend._store_initialized = True
             backend._use_fabric_mem = False
             backend._store_init_lock = MagicMock()
-            backend._perf_metrics = MagicMock()
-            backend._perf_metrics.measure.side_effect = (
-                lambda *args, **kwargs: nullcontext()
-            )
             backend.local_seg = None
             return backend
-
-    def test_disabled_perf_metrics_do_not_resolve_distributed_rank(self):
-        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import mooncake_backend
-
-        metrics = MagicMock(enabled=False)
-        parallel_config = MagicMock()
-        with patch.object(
-            mooncake_backend,
-            "get_global_rank",
-            side_effect=AssertionError("rank must not be resolved"),
-        ):
-            mooncake_backend._configure_perf_metric_labels(
-                metrics, parallel_config
-            )
-
-        metrics.configure_labels.assert_not_called()
 
     def test_exists(self):
         b = self._make_backend()
@@ -539,31 +518,6 @@ class TestMooncakeBackendMethods(unittest.TestCase):
         b.store.batch_put_session_end.assert_called_once_with(["k"])
         b.store.batch_put_session_revoke.assert_called_once_with(["k"])
         b.store.batch_get_session_end.assert_called_once_with(["k"])
-
-    def test_mooncake_operations_record_aggregated_timings_without_changing_results(self):
-        b = self._make_backend()
-        b.store = _StrictLayerwiseStore()
-        b._perf_metrics = MagicMock()
-        b._perf_metrics.measure.side_effect = lambda *args, **kwargs: nullcontext()
-
-        self.assertEqual(b.batch_put_start(["k"], [64]), [0])
-        self.assertEqual(b.batch_get_start(["k"]), [0])
-        self.assertEqual(b.batch_copy_put(["k"], [[100]], [[64]], [[0]]), [64])
-        self.assertEqual(b.batch_copy_get(["k"], [[200]], [[64]], [[0]]), [64])
-        self.assertEqual(b.batch_commit(["k"]), [0])
-        self.assertEqual(b.batch_get_end(["k"]), 0)
-
-        self.assertEqual(
-            b._perf_metrics.measure.call_args_list,
-            [
-                call("mooncake.batch_put_start", bytes_count=64),
-                call("mooncake.batch_get_start"),
-                call("mooncake.batch_copy_put", bytes_count=64),
-                call("mooncake.batch_copy_get", bytes_count=64),
-                call("mooncake.batch_commit"),
-                call("mooncake.batch_get_end"),
-            ],
-        )
 
     def test_validate_layerwise_support_checks_every_client_method(self):
         b = self._make_backend()

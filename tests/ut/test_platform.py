@@ -81,38 +81,6 @@ class TestNPUPlatform(TestBase):
         self.assertEqual(NPUPlatform.dispatch_key, "PrivateUse1")
         self.assertEqual(NPUPlatform.supported_quantization, [ASCEND_QUANTIZATION_METHOD, COMPRESSED_TENSORS_METHOD])
 
-    def test_fix_incompatible_config_preserves_concurrent_partial_prefills(self):
-        for max_num_partial_prefills, max_long_partial_prefills, threshold in (
-            (8, 8, 4096),
-            (40, 40, 768),
-        ):
-            with self.subTest(max_num_partial_prefills=max_num_partial_prefills):
-                vllm_config = TestNPUPlatform.mock_vllm_config()
-                vllm_config.scheduler_config.max_num_partial_prefills = (
-                    max_num_partial_prefills
-                )
-                vllm_config.scheduler_config.max_long_partial_prefills = (
-                    max_long_partial_prefills
-                )
-                vllm_config.scheduler_config.long_prefill_token_threshold = (
-                    threshold
-                )
-
-                self.platform._fix_incompatible_config(vllm_config)
-
-                self.assertEqual(
-                    vllm_config.scheduler_config.max_num_partial_prefills,
-                    max_num_partial_prefills,
-                )
-                self.assertEqual(
-                    vllm_config.scheduler_config.max_long_partial_prefills,
-                    max_long_partial_prefills,
-                )
-                self.assertEqual(
-                    vllm_config.scheduler_config.long_prefill_token_threshold,
-                    threshold,
-                )
-
     def test_is_sleep_mode_available(self):
         self.assertTrue(self.platform.is_sleep_mode_available())
 

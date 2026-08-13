@@ -30,10 +30,6 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
     LoadSpec,
     ReqMeta,
 )
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.perf_metrics import (
-    KVPoolPerfMetrics,
-    PerfMetricConfig,
-)
 
 
 class TestKVPoolWorkerHelpers(unittest.TestCase):
@@ -173,7 +169,6 @@ class TestKVPoolWorkerEarlyDispatch(unittest.TestCase):
         worker._layerwise_pd_transfer_waiter = None
         worker._layerwise_step_requires_save_gates = False
         worker.layerwise_offload = False
-        worker.perf_metrics = KVPoolPerfMetrics(PerfMetricConfig(False, 10))
         return worker
 
     def test_hook_dispatches_and_records_scatter_event(self):
@@ -3022,7 +3017,6 @@ class TestKVPoolWorkerMooncakeLayerSessions(unittest.TestCase):
         worker.kv_recv_thread = MagicMock()
         worker.sync_attn_events = [MagicMock(), MagicMock()]
         worker.layer_attn_recorded_events = [threading.Event(), threading.Event()]
-        worker.perf_metrics = KVPoolPerfMetrics(PerfMetricConfig(False, 10))
         return worker
 
     def test_next_chunk_renews_prefix_and_prior_complete_keys(self):
