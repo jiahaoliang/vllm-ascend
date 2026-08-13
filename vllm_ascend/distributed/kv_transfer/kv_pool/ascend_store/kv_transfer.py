@@ -46,6 +46,9 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_transfer
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mooncake_session_tracker import (
     MooncakeSessionTracker,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.perf_metrics import (
+    get_kvpool_perf_metrics,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.range_debug import (
     emit_commit_event,
     emit_range_event,
@@ -498,6 +501,8 @@ class KVTransferThread(threading.Thread):
         self.kv_event_lock = threading.Lock()
         self.kv_events: list[BlockStored] = []
         self._fatal_error: BaseException | None = None
+        self.perf_metrics = get_kvpool_perf_metrics()
+        self.perf_metrics.configure_labels(tp_rank=tp_rank)
 
     def prepare_layerwise_tasks(
         self,
@@ -1597,9 +1602,12 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         # no-op when synchronize() runs before record().
         if self.layer_attn_recorded_events is None or self.sync_attn_events is None:
             return
-        while not self.layer_attn_recorded_events[physical_layer].wait(timeout=10):
-            logger.info("Layerwise %d attention not recorded, keep waiting before slot_free", physical_layer)
-        self.sync_attn_events[physical_layer].synchronize()
+        with self.perf_metrics.measure(
+            "layerwise.attention_done_gate", layer_id=physical_layer
+        ):
+            while not self.layer_attn_recorded_events[physical_layer].wait(timeout=10):
+                logger.info("Layerwise %d attention not recorded, keep waiting before slot_free", physical_layer)
+            self.sync_attn_events[physical_layer].synchronize()
 
     def _set_slot_free(self, physical_layer: int) -> None:
         # slot_free = L2G copy done AND PD transfer done AND attention done.
@@ -1719,16 +1727,21 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             active_buffers = [list(row.buffers) for row in active_rows]
             active_sizes = [list(row.sizes) for row in active_rows]
             active_offsets = [list(row.offsets) for row in active_rows]
-            results = require_aligned_batch_results(
-                "batch_copy_put",
-                active_keys,
-                self.m_store.batch_copy_put(
+            with self.perf_metrics.measure(
+                "layerwise.batch_copy_put",
+                bytes_count=sum(sum(sizes) for sizes in active_sizes),
+                layer_id=layer_id,
+            ):
+                results = require_aligned_batch_results(
+                    "batch_copy_put",
                     active_keys,
-                    active_buffers,
-                    active_sizes,
-                    active_offsets,
-                ),
-            )
+                    self.m_store.batch_copy_put(
+                        active_keys,
+                        active_buffers,
+                        active_sizes,
+                        active_offsets,
+                    ),
+                )
             emit_range_event("save", layer_id, active_sizes, active_offsets, results)
             failed_keys = [key for key, result in zip(active_keys, results, strict=True) if result < 0]
             if failed_keys:
@@ -1742,11 +1755,14 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             active_keys = [row.key for row in req_meta.rows if row.key in self._active_put_keys]
             if active_keys:
                 try:
-                    commit_results = require_aligned_batch_results(
-                        "batch_commit",
-                        active_keys,
-                        self.m_store.batch_commit(active_keys),
-                    )
+                    with self.perf_metrics.measure(
+                        "layerwise.batch_commit", layer_id=layer_id
+                    ):
+                        commit_results = require_aligned_batch_results(
+                            "batch_commit",
+                            active_keys,
+                            self.m_store.batch_commit(active_keys),
+                        )
                     emit_commit_event(layer_id, len(active_keys), commit_results)
                 except Exception as exc:
                     logger.error(
@@ -1900,14 +1916,19 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                 gvas_array = np.concatenate(all_gvas) if len(all_gvas) > 1 else all_gvas[0]
                 addr_array = np.concatenate(all_addrs) if len(all_addrs) > 1 else all_addrs[0]
                 size_array = np.concatenate(all_sizes) if len(all_sizes) > 1 else all_sizes[0]
-                res = self._batch_copy_with_limits(
-                    gvas_array,
-                    addr_array,
-                    size_array,
-                    0,
-                    self.max_transfer_blocks,
-                    self.max_transfer_bytes,
-                )
+                with self.perf_metrics.measure(
+                    "layerwise.gva_save",
+                    bytes_count=int(np.sum(size_array)),
+                    layer_id=physical_layer,
+                ):
+                    res = self._batch_copy_with_limits(
+                        gvas_array,
+                        addr_array,
+                        size_array,
+                        0,
+                        self.max_transfer_blocks,
+                        self.max_transfer_bytes,
+                    )
                 if physical_layer <= 2 or res != 0:
                     logger.info(
                         "save_thread: layer=%d groups=%d blocks=%d res=%d",
@@ -1930,7 +1951,10 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                         )
 
             if self.pd_transfer_waiter is not None:
-                self.pd_transfer_waiter(physical_layer)
+                with self.perf_metrics.measure(
+                    "layerwise.pd_transfer_gate", layer_id=physical_layer
+                ):
+                    self.pd_transfer_waiter(physical_layer)
             self._wait_attention_done(physical_layer)
 
             if has_any_save:
@@ -2100,16 +2124,22 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 request_rows = [req_meta.rows[index] for index in request_indices]
                 request_keys = [row.key for row in request_rows]
                 try:
-                    request_results = require_aligned_batch_results(
-                        "batch_copy_get",
-                        request_keys,
-                        self.m_store.batch_copy_get(
+                    request_sizes = [list(row.sizes) for row in request_rows]
+                    with self.perf_metrics.measure(
+                        "layerwise.batch_copy_get",
+                        bytes_count=sum(sum(sizes) for sizes in request_sizes),
+                        layer_id=layer_id,
+                    ):
+                        request_results = require_aligned_batch_results(
+                            "batch_copy_get",
                             request_keys,
-                            [list(row.buffers) for row in request_rows],
-                            [list(row.sizes) for row in request_rows],
-                            [list(row.offsets) for row in request_rows],
-                        ),
-                    )
+                            self.m_store.batch_copy_get(
+                                request_keys,
+                                [list(row.buffers) for row in request_rows],
+                                request_sizes,
+                                [list(row.offsets) for row in request_rows],
+                            ),
+                        )
                 except Exception as exc:
                     logger.error(
                         "Layerwise load request range failed layer=%d request=%s error=%s",
@@ -2180,8 +2210,11 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
 
             if len(transfer_tasks) == 0:
                 if wait_for_save is not None:
-                    while not self.layer_save_finished_events[wait_for_save].wait(timeout=10):
-                        logger.info("Layerwise %d save wait timed out, keep waiting before load", wait_for_save)
+                    with self.perf_metrics.measure(
+                        "reuse3.wait_for_save_layer", layer_id=layer_id
+                    ):
+                        while not self.layer_save_finished_events[wait_for_save].wait(timeout=10):
+                            logger.info("Layerwise %d save wait timed out, keep waiting before load", wait_for_save)
                     logger.debug("Layer save event cleared: layer %d", wait_for_save)
                     self.layer_save_finished_events[wait_for_save].clear()
                 succeeded = True
@@ -2229,18 +2262,37 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                     return
 
             if wait_for_save is not None:
-                while not self.layer_save_finished_events[wait_for_save].wait(timeout=10):
-                    logger.info("Layerwise %d save wait timed out, keep waiting before load", wait_for_save)
+                with self.perf_metrics.measure(
+                    "reuse3.wait_for_save_layer", layer_id=layer_id
+                ):
+                    while not self.layer_save_finished_events[wait_for_save].wait(timeout=10):
+                        logger.info("Layerwise %d save wait timed out, keep waiting before load", wait_for_save)
                 logger.debug("Layer save event cleared: layer %d", wait_for_save)
                 self.layer_save_finished_events[wait_for_save].clear()
 
             if attention_start_gate is not None:
-                while not attention_start_gate.wait(timeout=10):
-                    logger.info("Layerwise %d load waits for attention compute start", layer_id)
+                with self.perf_metrics.measure(
+                    "reuse3.attention_start_gate", layer_id=layer_id
+                ):
+                    while not attention_start_gate.wait(timeout=10):
+                        logger.info("Layerwise %d load waits for attention compute start", layer_id)
 
             if range_meta is not None:
                 assert range_shared is not None
-                self._handle_range_request(range_meta, range_shared)
+                event_name = (
+                    "reuse3.slot_reload"
+                    if wait_for_save is not None
+                    else "layerwise.range_load"
+                )
+                bytes_count = sum(
+                    sum(row.sizes) for row in range_meta.rows
+                )
+                with self.perf_metrics.measure(
+                    event_name,
+                    bytes_count=bytes_count,
+                    layer_id=layer_id,
+                ):
+                    self._handle_range_request(range_meta, range_shared)
                 succeeded = True
                 return
 
@@ -2258,14 +2310,23 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             gvas_array = np.concatenate(all_gvas) if len(all_gvas) > 1 else all_gvas[0]
             addr_array = np.concatenate(all_addrs) if len(all_addrs) > 1 else all_addrs[0]
             size_array = np.concatenate(all_sizes) if len(all_sizes) > 1 else all_sizes[0]
-            res = self._batch_copy_with_limits(
-                gvas_array,
-                addr_array,
-                size_array,
-                1,
-                self.max_transfer_blocks,
-                self.max_transfer_bytes,
-            )
+            with self.perf_metrics.measure(
+                (
+                    "reuse3.slot_reload"
+                    if wait_for_save is not None
+                    else "layerwise.gva_load"
+                ),
+                bytes_count=int(np.sum(size_array)),
+                layer_id=layer_id,
+            ):
+                res = self._batch_copy_with_limits(
+                    gvas_array,
+                    addr_array,
+                    size_array,
+                    1,
+                    self.max_transfer_blocks,
+                    self.max_transfer_bytes,
+                )
             if layer_id <= 2 or res != 0:
                 logger.info(
                     "load_thread: layer=%d groups=%d blocks=%d res=%d",

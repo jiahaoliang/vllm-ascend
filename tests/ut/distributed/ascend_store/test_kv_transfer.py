@@ -19,6 +19,7 @@ import json
 import os
 import threading
 import unittest
+from contextlib import nullcontext
 from unittest.mock import MagicMock, call, patch
 
 import numpy as np
@@ -2507,6 +2508,29 @@ class TestKVCacheStoreLayerRecvingThread(unittest.TestCase):
             [["shared-key", "r1-key"], ["shared-key", "r2-key"]],
         )
         self.assertEqual(invalid_block_ids, set())
+
+    def test_ranged_load_distinguishes_ordinary_and_reused_slot_timings(self):
+        thread, _, _, _, _ = self._make_thread(num_layers=1)
+        thread.perf_metrics = MagicMock()
+        thread.perf_metrics.measure.side_effect = (
+            lambda *args, **kwargs: nullcontext()
+        )
+
+        ordinary = self._make_load_task(thread, 0)
+        self._run_task(thread, ordinary)
+        thread.layer_load_finished_events[0].clear()
+        thread.layer_save_finished_events[0].set()
+        reused = self._make_load_task(thread, 0)
+        reused.wait_for_save_layer = 0
+        self._run_task(thread, reused)
+
+        measure_names = [
+            selected.args[0]
+            for selected in thread.perf_metrics.measure.call_args_list
+        ]
+        self.assertIn("layerwise.range_load", measure_names)
+        self.assertIn("reuse3.wait_for_save_layer", measure_names)
+        self.assertIn("reuse3.slot_reload", measure_names)
 
     def test_concurrent_request_failure_filters_only_its_row(self):
         thread, store, invalid_block_ids, _, load_abort_event = self._make_thread()
